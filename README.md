@@ -14,6 +14,8 @@ mesh) and tinted by a **color picker** (dark brown by default).
 
 Everything runs locally in the browser — no build step, no network needed.
 
+<img width="1800" height="1442" alt="image" src="https://github.com/user-attachments/assets/b6d361d8-3d1f-4f9c-8f9f-23503dddd287" />
+
 ## Run it
 
 Open `index.html` in any modern browser (double-clicking works — all assets
