@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WaterSim 3D — Navier–Stokes Planet Ocean</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="viewport"></div>
+
+  <!-- explicit physics-backend label: what actually integrates the solver
+       this frame — WebGPU compute, or the fallback CPU solver (and why) -->
+  <div id="solverBadge" class="fallback">Physics: CPU fallback &middot; WebGPU off (experimental)</div>
+
+  <div id="loading"><div class="spinner"></div><div id="loadingText">filling the ocean&hellip;</div></div>
+
+  <header id="hdr">
+    <h1>WaterSim <span>3D</span></h1>
+    <p class="eq">
+      &part;<b>u</b>/&part;t + (<b>u</b>&middot;&nabla;)<b>u</b> =
+      &minus;&nabla;p/&rho; + &nu;&nabla;&sup2;<b>u</b> + <b>g</b>
+      &nbsp;&nbsp;&nbsp; &nabla;&middot;<b>u</b> = 0
+    </p>
+    <p class="sub">Eulerian MAC grid &middot; FLIP/PIC particles &middot; pressure projection (free surface p = p<sub>atm</sub>) &middot; Archimedes buoyancy &middot; CFL advection</p>
+  </header>
+
+  <aside id="panel">
+    <h2>Simulation</h2>
+    <div class="row btns">
+      <button id="btnPause">&#9203; Pause</button>
+      <button id="btnReset">&#8635; Reset water</button>
+    </div>
+    <div class="row btns">
+      <button id="btnClearBalls">&#10006; Clear</button>
+    </div>
+
+    <details class="fold">
+      <summary>Physics</summary>
+      <label class="slider"><span>Gravity <output id="gravityVal"></output></span>
+        <input type="range" id="rangeGravity" min="0" max="25" step="0.01" value="9.81"></label>
+      <label class="slider"><span>Viscosity &nu; <output id="viscVal"></output></span>
+        <input type="range" id="rangeVisc" min="0" max="0.02" step="0.0001" value="0.0005"></label>
+      <label class="slider"><span>PIC blend (smoothing) <output id="picVal"></output></span>
+        <input type="range" id="rangePic" min="0" max="0.3" step="0.01" value="0.15"></label>
+      <label class="slider"><span>Pressure iterations <output id="iterVal"></output></span>
+        <input type="range" id="rangeIters" min="10" max="120" step="5" value="20"></label>
+      <label class="slider"><span>Min substeps <output id="subVal"></output></span>
+        <input type="range" id="rangeSubsteps" min="1" max="4" step="1" value="1"></label>
+      <label class="slider"><span>Time scale <output id="timeVal"></output></span>
+        <input type="range" id="rangeTime" min="0.1" max="2" step="0.05" value="1"></label>
+      <label class="slider"><span>Surface threshold <output id="isoVal"></output></span>
+        <input type="range" id="rangeIso" min="0.2" max="3" step="0.01" value="1.8"></label>
+    </details>
+
+    <h2>Display</h2>
+    <label class="slider"><span>Water surface opacity <output id="wOpaVal"></output></span>
+      <input type="range" id="rangeWOpa" min="0.15" max="0.95" step="0.01" value="0.25"></label>
+    <!-- nonlinear track (mapped in main.js): bottom half = 0&ndash;0.1 in 0.02% steps,
+         top half = 0.1&ndash;1; value below is the slider POSITION for the 0.5 default -->
+    <label class="slider"><span>Spray &amp; atmosphere opacity <output id="pOpaVal"></output></span>
+      <input type="range" id="rangePOpa" min="0" max="1" step="0.001" value="0.722"></label>
+    <label class="check"><input type="checkbox" id="chkGpu"> GPU solver &mdash; WebGPU compute (experimental yet &mdash; falls back to CPU)</label>
+    <label class="check"><input type="checkbox" id="chkParticles" checked> Spray particles</label>
+    <label class="check"><input type="checkbox" id="chkBeads" checked> Water beads &mdash; glossy ball particles, no surface</label>
+    <label class="check"><input type="checkbox" id="chkVectors"> Water velocity vectors (direction &amp; speed)</label>
+    <label class="check"><span>Resolution
+      <select id="selRes">
+        <option value="auto50">Auto detail &mdash; 50 FPS target</option>
+        <option value="auto25">Auto detail &mdash; 25 FPS target</option>
+        <option value="eco">Eco &mdash; 18³</option>
+        <option value="tiny">Tiny &mdash; 22³</option>
+        <option value="balanced">Balanced &mdash; 26³</option>
+        <option value="low">Low &mdash; 30³</option>
+        <option value="medium" selected>Medium &mdash; 40³</option>
+        <option value="high">High &mdash; 50³</option>
+        <option value="ultra">Ultra &mdash; 62³</option>
+        <option value="extreme">Extreme &mdash; 72³</option>
+      </select></span></label>
+    <button id="btnCalibrate">Recalibrate target (refills ocean)</button>
+    <details class="helpfold">
+      <summary>&#9432; About auto detail</summary>
+      <p class="help">Auto tests increasing grid, particle and rendering detail with a 20% frame-budget reserve. The highest passing tier stays fixed; render scale adapts without resetting water. Targets are not guarantees. Recalibrate after changing physics or window size.</p>
+    </details>
+
+    <h2>Planet size</h2>
+    <details class="helpfold">
+      <summary>&#9432; About planet size</summary>
+      <p class="help">Radius sizes the rocky globe (0.5&ndash;25 m — sea level, terrain relief, gravity, balls, camera and sky all scale with it, so every size behaves like the default world); ocean volume scales how much water fills it (particle count &times;0.1&ndash;&times;50 of the active detail preset); bumpiness 0 gives a smooth voxel ball. Applies on release.</p>
+    </details>
+    <label class="slider"><span>Planet radius <output id="coreVal"></output></span>
+      <input type="range" id="rangeCore" min="0.5" max="25" step="0.05" value="11"></label>
+    <label class="slider"><span>Ocean volume <output id="oceanVVal"></output></span>
+      <input type="range" id="rangeOceanV" min="0.1" max="50" step="0.1" value="3"></label>
+    <label class="slider"><span>Planet bumpiness <output id="bumpVal"></output></span>
+      <input type="range" id="rangeBump" min="0" max="2" step="0.05" value="0.25"></label>
+    <label class="slider"><span>Planet color &mdash; gouraud voxel terrain</span>
+      <input type="color" id="pickPlanet" value="#654321" style="width:100%;height:26px;cursor:pointer;background:none;border:none;padding:0"></label>
+    <label class="slider"><span>Water color &mdash; surface &amp; droplets</span>
+      <input type="color" id="pickWater" value="#9fd4ee" style="width:100%;height:26px;cursor:pointer;background:none;border:none;padding:0"></label>
+    <label class="slider"><span>Heat conductivity <output id="heatKVal"></output></span>
+      <input type="range" id="rangeHeatK" min="0" max="2" step="0.05" value="0.6"></label>
+
+    <h2>Orbit &amp; rotation</h2>
+    <details class="helpfold">
+      <summary>&#9432; About orbit, day/night &amp; seasons</summary>
+      <p class="help">The Sun is fixed; the planet revolves around it (one &ldquo;year&rdquo;) and spins about its vertical axis (one &ldquo;day&rdquo; &mdash; the day/night cycle). The spin axis can be tilted against the orbit (axial tilt &mdash; the tilted axis keeps its direction in space, so the year brings seasons: each hemisphere leans toward the Sun on opposite sides of the orbit). Shorter period = faster motion.</p>
+    </details>
+    <label class="slider"><span>Year &mdash; orbit around the Sun <output id="yearVal"></output></span>
+      <input type="range" id="rangeYear" min="0.5" max="30" step="0.5" value="20"></label>
+    <label class="slider"><span>Day &mdash; spin about its axis <output id="spinVal"></output></span>
+      <input type="range" id="rangeSpin" min="0.5" max="20" step="0.5" value="5"></label>
+    <label class="slider"><span>Axial tilt &mdash; spin axis vs orbit <output id="tiltVal"></output></span>
+      <input type="range" id="rangeTilt" min="0" max="45" step="0.5" value="30"></label>
+
+    <h2>Ocean dynamics</h2>
+    <label class="slider"><span>Swirl &amp; eddies <output id="vortVal"></output></span>
+      <input type="range" id="rangeVort" min="0" max="1.5" step="0.05" value="0"></label>
+    <label class="slider"><span>Subsurface currents <output id="currVal"></output></span>
+      <input type="range" id="rangeCurr" min="0" max="1.5" step="0.05" value="0"></label>
+    <label class="slider"><span>Sun activity <output id="sunActVal"></output></span>
+      <input type="range" id="rangeSunAct" min="0" max="2" step="0.01" value="0.23"></label>
+    <label class="slider"><span>Atmosphere height <output id="atmVal"></output></span>
+      <input type="range" id="rangeAtm" min="0.05" max="20" step="0.05" value="1.65"></label>
+    <label class="slider"><span>Thunderstorm intensity <output id="stormVal"></output></span>
+      <input type="range" id="rangeStorm" min="-2" max="1" step="0.05" value="-1"></label>
+    <!-- hidden per spec: the vapor ceiling-bounce curve stays 'linear' (kept in
+         the DOM so the solver binding keeps working; change via the console) -->
+    <label class="check" style="display:none"><span>Vapor ceiling reflection
+      <select id="selCeil">
+        <option value="linear" selected>Linear with height</option>
+        <option value="quadratic">Quadratic with height</option>
+        <option value="exponential">Exponential with height</option>
+      </select></span></label>
+    <details class="helpfold">
+      <summary>&#9432; About the atmosphere &amp; water cycle</summary>
+      <p class="help">Eddies keep whirling after a splash; slow streams wander beneath the surface. Sun activity heats the lit side and drives evaporation: every water surface parcel evaporates with probability growing exponentially from the coldest water temperature to the hottest, so the night side evaporates too &mdash; just much slower. Vapor cloudlets ride circulating winds, stay aloft on a buoyant layer, and bounce off the atmosphere ceiling (probability rising with height) and off the terrain. In shade vapor cools, condenses and rains back down; dense vapor pockets crackle with lightning &mdash; the thunderstorm slider scales how easily they fire (&times;0.01&ndash;&times;10, logarithmic, &times;0.1 by default). The atmosphere height is the REAL ceiling: evaporated particles and droplets can rise exactly that far above sea level, on any planet size.</p>
+    </details>
+
+    <details class="fold">
+      <summary>Help</summary>
+      <p class="help">
+        Drag &mdash; orbit camera &middot; wheel &mdash; zoom<br>
+        <b>Alt + drag</b> &mdash; stir the water<br>
+        Keys: <b>Space</b> pause &middot; <b>R</b> reset &middot; <b>S</b> splash &middot;
+        <b>B</b> ball &middot; <b>V</b> velocity vectors &middot; <b>P</b> particles
+      </p>
+    </details>
+  </aside>
+
+  <div id="stats">
+    <div><span>physics solver</span><b id="stBackend">CPU</b></div>
+    <div><span>FPS</span><b id="stFps">&ndash;</b></div>
+    <div><span>detail</span><b id="stQuality">&ndash;</b></div>
+    <div><span>sim</span><b id="stSim">&ndash;</b> ms</div>
+    <div><span>particles</span><b id="stParticles">&ndash;</b></div>
+    <div><span>airborne</span><b id="stAir">&ndash;</b></div>
+    <div><span>vapor / night</span><b id="stVapor">&ndash;</b></div>
+    <div><span>dry land</span><b id="stDry">&ndash;</b></div>
+    <div><span>max |u|</span><b id="stUmax">&ndash;</b> m/s</div>
+    <div><span>substep dt</span><b id="stDt">&ndash;</b> ms</div>
+  </div>
+
+  <script src="vendor/three.min.js"></script>
+  <script src="js/surface.js"></script>
+  <script src="js/solver.js"></script>
+  <script src="js/gpu/shaders.js"></script>
+  <script src="js/gpu/gpusim.js"></script>
+  <script src="js/controls.js"></script>
+  <script src="js/scene.js"></script>
+  <script src="js/quality.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
