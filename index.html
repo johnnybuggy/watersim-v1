@@ -61,6 +61,8 @@
     <label class="slider"><span>Spray &amp; atmosphere opacity <output id="pOpaVal"></output></span>
       <input type="range" id="rangePOpa" min="0" max="1" step="0.001" value="0.722"></label>
     <label class="check"><input type="checkbox" id="chkGpu"> GPU solver &mdash; WebGPU compute (experimental yet &mdash; falls back to CPU)</label>
+    <label class="check"><input type="checkbox" id="chkMt" checked> Multithreaded solver &mdash; CPU worker pool</label>
+    <div class="help" id="mtHint" style="display:none; margin: -4px 0 6px;"></div>
     <label class="check"><input type="checkbox" id="chkParticles" checked> Spray particles</label>
     <label class="check"><input type="checkbox" id="chkBeads" checked> Water beads &mdash; glossy ball particles, no surface</label>
     <label class="check"><input type="checkbox" id="chkVectors"> Water velocity vectors (direction &amp; speed)</label>
@@ -163,6 +165,8 @@
 
   <script src="vendor/three.min.js"></script>
   <script src="js/surface.js"></script>
+  <script src="js/mt/tasks.js"></script>
+  <script src="js/mt/pool.js"></script>
   <script src="js/solver.js"></script>
   <script src="js/gpu/shaders.js"></script>
   <script src="js/gpu/gpusim.js"></script>

@@ -14,8 +14,6 @@ mesh) and tinted by a **color picker** (dark brown by default).
 
 Everything runs locally in the browser — no build step, no network needed.
 
-<img width="2056" height="1502" alt="image" src="https://github.com/user-attachments/assets/4a1b2528-bc03-4c87-b5e9-fa9c35f73aeb" />
-
 ## Run it
 
 Open `index.html` in any modern browser (double-clicking works — all assets
@@ -26,6 +24,18 @@ Optionally serve it instead:
 ```bash
 python3 -m http.server 8000     # then open http://localhost:8000
 ```
+
+To run with the **multithreaded solver** (worker pool over all cores), serve
+with the cross-origin-isolation headers so the browser exposes
+`SharedArrayBuffer`:
+
+```bash
+python3 serve.py 8080           # then open http://127.0.0.1:8080
+```
+
+The stats badge then reads "Physics: CPU · N threads". Plain `file://` (or a
+server without COOP/COEP headers) silently falls back to the serial solver —
+same physics, one thread.
 
 **Interactions**
 
@@ -421,18 +431,83 @@ submerged = ρ_ball/ρ_water exactly).
   sim time; the dry percentage (land with no water sitting on it — beached
   puddles count as wet) shows in the stats panel.
 
+## Troubleshooting
+
+**The "Multithreaded solver" checkbox is disabled** — the worker pool needs a
+shared-memory `SharedArrayBuffer`, which browsers only grant to
+*cross-origin isolated* pages (COOP/COEP headers). CPU core count plays no
+role in this. Open the app through the bundled server:
+
+```
+python3 serve.py          # adds Cross-Origin-Opener-Policy / Embedder-Policy
+# then visit http://127.0.0.1:8080
+```
+
+On `file://` or any static server without those headers the checkbox greys
+out, an inline hint under it explains why, and the solver stays on the serial
+path (by design — the page still runs). If the pool faults at runtime (worker
+load failure), the app logs `MT step failed` once, unchecks the toggle, and
+continues on the serial path instead of erroring every frame.
+
+## Multithreading
+
+`enableMultithreading(threads)` re-binds the solver's fields onto a
+`SharedArrayBuffer` and spawns a worker pool (`js/mt/pool.js`) with one worker
+per requested thread plus the coordinator, which runs its own chunk inline so
+every core is busy. Each stage of the step is dispatched as a *job* over the
+mailbox control buffer (`js/mt/pool.js` ↔ `js/mt/node-worker.js` /
+`web-worker.js`); the worker executes its chunk of the task against the shared
+state through a view of the same typed arrays.
+
+- **Stage slicing** — particle stages (mark, P2G, G2P, advect, heat, evaporate)
+  partition linearly; grid stages (BC, gravity, projection, velocity clamp)
+  slice by k-planes. Stages that share an index space and don't cross-slab
+  read ride in one dispatch (e.g. gravity + the boundary re-clamp, or
+  mark + push-balls + P2G).
+- **Barriers** — Node uses an `Atomics.wait`/`notify` mailbox so the whole
+  step stays synchronous (the headless tests run the MT path unchanged); the
+  main-thread barrier spins through the short completion window and parks
+  bounded only past it (a macOS `Atomics.wait` wake costs milliseconds).
+  Workers adaptively spin during dispatch bursts and back off to deep sleeps
+  while idle. Browsers can't `Atomics.wait` on the main thread, so the same
+  dispatches run as promises (`step()` then-able) and the render loop waits
+  for completion.
+- **Determinism** — per-chunk stochastic streams (vapor advection,
+  evaporation) are seeded per (seed, task, worker, tick), so repeated runs at
+  a fixed thread count are bit-identical (`test/mt.test.js` asserts it).
+  Particle velocities diverge from the serial path at float-roundoff scale
+  (~1e-7 m/s after 120 frames); grid fields match the serial solver exactly.
+- **Serial stays the contract** — without `SharedArrayBuffer`/workers, or
+  with the toggle off (`Multithreaded solver` checkbox) or the GPU solver
+  enabled, `step()` runs the original serial path.
+
+```bash
+node test/mt.test.js            # pool lifecycle, serial↔MT parity, determinism, invariants
+node .bench/mt_compare.js 60    # speedup table: serial vs 2/4/6/(cores-1) threads
+```
+
+On an M1 Max the pool measures ~2× at 4–6 threads on the auto-detail preset
+(the per-dispatch mailbox round trip dominates on small grids — larger
+resolutions and particle counts scale further; the physics is identical at
+every thread count).
+
 ## Architecture
 
 ```
 index.html          UI shell (control panel, stats, help)
 css/style.css       dark glass styling
 js/solver.js        the Navier–Stokes FLIP solver (no dependencies)
+js/mt/tasks.js      worker-side task registry (stage codes, chunk runners)
+js/mt/pool.js       worker pool: mailbox dispatch, barriers, reductions
+js/mt/node-worker.js   worker entry: Node worker_threads (sync mailbox)
+js/mt/web-worker.js    worker entry: browser Web Workers (async)
 js/surface.js       marching-tetrahedra isosurface + volume integral
 js/controls.js      minimal orbit camera
 js/scene.js         Three.js planet scene (voxel terrain, atmosphere, starfield, lights)
 js/main.js          loop, UI wiring, stir/splash interactions, hardware calibration
 js/quality.js       frame-budget policy and adaptive render-scale controller
 vendor/three.min.js Three.js r128 (vendored, works offline)
+serve.py            static server with COOP/COEP (enables SharedArrayBuffer)
 test/solver.test.js headless physics tests (node)
 ```
 
@@ -446,6 +521,7 @@ node test/scene.smoke.js
 node test/surface.test.js
 node test/quality.test.js
 node test/main.test.js
+node test/mt.test.js        # multithreaded solver: parity, determinism, invariants
 node test/performance.js    # CPU step + surface benchmark, three presets
 node test/browser.test.js   # optional: local Chrome, real WebGL + screenshots
 ```

@@ -42,11 +42,13 @@ var params = {
   waterBeads: true,
   thunder: -1,          // log exponent: ×10^-1 = ×0.1 storm rate by default (slider −2…+1 → ×0.01…×10)
   gpuSim: false,        // experimental WebGPU solver — off by default, CPU fallback runs
+  mt: true,             // multithreaded CPU solver (worker pool); off when GPU sim is on
   stirMode: false
 };
 
 var solver = null, scene = null;
 var paused = false;
+var stepBusy = false;   // an async (multithreaded) step is in flight
 var lastT = 0;
 var simMs = 0, fpsEma = 60, statTimer = 0, dryTimer = 11;   // dryTimer: first census fires immediately
 var stirring = false, handPos = null, handPrev = null, handVel = [0, 0, 0];
@@ -90,6 +92,12 @@ function buildSolver(resKey) {
   activeRes = p.key;
   dirty = true;
   dryTimer = 11;
+  // tear down the outgoing solver's worker pool before it is abandoned
+  // (calibration rebuilds worlds several times — stray pools would linger)
+  if (solver && solver.mtStatus && solver.mtStatus().active) {
+    mtPending = false;
+    solver.disableMultithreading();
+  }
   // ocean-volume label depends on the active preset's particle target
   var ovOut = $('oceanVVal');
   if (ovOut) ovOut.textContent = oceanVFmt(params.oceanVolume);
@@ -106,6 +114,7 @@ function buildSolver(resKey) {
   });
   s.resetWater(oceanDepthFor());
   solver = s;
+  applyMt();
   solver.substeps = params.substeps;
   solver.pressureIters = params.iters;
   solver.gravity = gravityScaled();
@@ -142,6 +151,44 @@ function installWorld(key) {
 }
 function targetFPS() {
   return $('selRes').value === 'auto50' ? 50 : $('selRes').value === 'auto25' ? 25 : 0;
+}
+// ------------------------------------------------------ multithreaded solver
+// Worker-pool CPU multithreading (SharedArrayBuffer + workers). The pool
+// re-binds the solver's fields to shared memory; the serial path stays the
+// physics reference. Disabled while the experimental GPU solver owns stepping.
+// Why the worker pool isn't running despite the checkbox — shown on the badge
+// so an unsupported environment isn't a silent no-op.
+var mtNote = '';
+var mtPending = false;   // a switch was requested while a step is in flight
+function applyMt() {
+  if (!solver) return;
+  var supported = typeof MTPool !== 'undefined' && MTPool.supported();
+  var want = params.mt && !params.gpuSim && supported;
+  var st = solver.mtStatus ? solver.mtStatus() : null;
+  mtNote = '';
+  if (params.mt && !params.gpuSim && !supported) {
+    mtNote = 'SharedArrayBuffer unavailable — serve with `python3 serve.py`';
+    if (typeof MTPool === 'undefined') mtNote = 'mt/pool.js not loaded';
+  }
+  if (want && !(st && st.active)) {
+    if (stepBusy) { mtPending = true; renderBackend(); return; }   // apply after the in-flight step
+    try {
+      solver.enableMultithreading(MTPool.coreCount() - 1);
+      st = solver.mtStatus();
+      if (!(st && st.active)) mtNote = mtNote || 'worker pool failed to start';
+    } catch (e) {
+      console.warn('Multithreading unavailable:', e.message);
+      mtNote = 'worker pool unavailable: ' + (e.message || e);
+      params.mt = false;
+      var chk = $('chkMt');
+      if (chk) chk.checked = false;
+      solver._mtFailed = String(e.message || e);
+    }
+  } else if (!want && st && st.active) {
+    if (stepBusy) { mtPending = false; renderBackend(); return; }  // apply after the in-flight step
+    solver.disableMultithreading();
+  }
+  renderBackend();
 }
 // ------------------------------------------------------------- GPU solver
 // The compute-shader host takes over per-frame dynamics when WebGPU is
@@ -186,14 +233,19 @@ function gpuNotice(state) {
 }
 function renderBackend() {
   var onGpu = !!(gpuSim && gpuSim.ready && gpuSim.solver === solver && params.gpuSim);
+  var st = solver && solver.mtStatus ? solver.mtStatus() : null;
+  var onMt = !!(!onGpu && st && st.active);
   var badge = $('solverBadge'), be = $('stBackend');
-  if (be) be.textContent = onGpu ? 'GPU · WebGPU' : 'CPU · fallback';
+  if (be) be.textContent = onGpu ? 'GPU · WebGPU' : onMt ? 'CPU · ' + st.threads + ' threads' : 'CPU · single thread';
   if (badge) {
+    var note = backendNote || mtNote;
     badge.textContent = onGpu ? 'Physics: GPU · WebGPU compute'
-                              : 'Physics: CPU fallback · ' + (backendNote || 're-initializing WebGPU…');
+                       : onMt ? 'Physics: CPU · ' + st.threads + ' threads'
+                              : 'Physics: CPU · single thread' + (note ? ' · ' + note : '');
     if (badge.classList) {
       badge.classList.toggle('gpu', onGpu);
-      badge.classList.toggle('fallback', !onGpu);
+      badge.classList.toggle('mt', onMt);
+      badge.classList.toggle('fallback', !onGpu && !onMt);
     }
   }
 }
@@ -260,29 +312,35 @@ function calibrate(fps) {
     // Read-only diagnostics for reproducible browser checks.
     window.waterSimPerformance = { targetFPS: fps, measuredBudgetFPS: testFPS, level: key, samples: calibrationResults };
   }
+  function calibrationGiveUp(error) {
+    console.error('Detail calibration failed', error);
+    // Restore a known affordable world, not the potentially expensive
+    // failing probe. If rendering itself is unavailable, leave controls
+    // usable and report that failure rather than retrying indefinitely.
+    try {
+      installWorld(chosen || 'eco');
+      qualityController = new AdaptiveQuality.Controller(testFPS,
+        Math.min(window.devicePixelRatio || 1, RES_PRESETS[activeRes].pixelRatio));
+    } catch (restoreError) { console.error('World recovery failed', restoreError); }
+    calibrating = false;
+    scene.orbit.enabled = true;
+    $('panel').inert = false;
+    $('loading').style.display = 'none';
+    calibrationResults = [];
+    qualityMessage = RES_PRESETS[activeRes].label + ' / calibration failed';
+    qualityStatus();
+    dirty = true; lastT = performance.now();
+  }
   function sample(now) {
-    try { measureSample(now); }
+    try {
+      var r = measureSample(now);
+      if (r && r.then) r.catch(calibrationGiveUp);
+    }
     catch (error) {
-      console.error('Detail calibration failed', error);
-      // Restore a known affordable world, not the potentially expensive
-      // failing probe. If rendering itself is unavailable, leave controls
-      // usable and report that failure rather than retrying indefinitely.
-      try {
-        installWorld(chosen || 'eco');
-        qualityController = new AdaptiveQuality.Controller(testFPS,
-          Math.min(window.devicePixelRatio || 1, RES_PRESETS[activeRes].pixelRatio));
-      } catch (restoreError) { console.error('World recovery failed', restoreError); }
-      calibrating = false;
-      scene.orbit.enabled = true;
-      $('panel').inert = false;
-      $('loading').style.display = 'none';
-      calibrationResults = [];
-      qualityMessage = RES_PRESETS[activeRes].label + ' / calibration failed';
-      qualityStatus();
-      dirty = true; lastT = performance.now();
+      calibrationGiveUp(error);
     }
   }
-  function measureSample(now) {
+  async function measureSample(now) {
     if (token !== calibrationToken) return;
     if (document.hidden) { previousRefresh = 0; requestAnimationFrame(sample); return; }
     // RAF can only present on display refresh boundaries. On 60 Hz a 20 ms
@@ -313,7 +371,10 @@ function calibrate(fps) {
     }
     var start = performance.now();
     advanceCelestial(params.timeScale / testFPS);
-    solver.step(params.timeScale / testFPS);
+    // The multithreaded solver returns a promise (async worker dispatch):
+    // calibration measures the FULL physics cost, so await it.
+    var stepResult = solver.step(params.timeScale / testFPS);
+    if (stepResult && stepResult.then) await stepResult;
     updateSurface();
     scene.updateParticles(solver, params.showParticles);
     scene.syncBalls(solver.balls);
@@ -540,6 +601,39 @@ function bindUI() {
       params.gpuSim = this.checked;
       gpuNotice(params.gpuSim ? 'starting' : 'disabled');
       if (params.gpuSim && !gpuSim && solver) ensureGpu(solver);
+      applyMt();   // GPU owns stepping → release the CPU worker pool (and back)
+    });
+  }
+  var chkMt = $('chkMt');
+  if (chkMt) {
+    var mtSupported = typeof MTPool !== 'undefined' && MTPool.supported();
+    if (!mtSupported) {
+      // No usable SharedArrayBuffer (file:// or a server without COOP/COEP):
+      // the toggle would be a silent no-op — disable it and say why, twice
+      // (inline hint for the eye, console line for the why).
+      chkMt.checked = false;
+      chkMt.disabled = true;
+      var why = typeof MTPool === 'undefined' ? 'mt/pool.js not loaded'
+        : (location.protocol === 'file:' ? 'file:// has no SharedArrayBuffer'
+           : 'page is not cross-origin isolated (missing COOP/COEP headers)');
+      chkMt.title = 'Multithreading needs SharedArrayBuffer — ' + why +
+                    '. Serve with `python3 serve.py` and open http://127.0.0.1:8080';
+      var hint = $('mtHint');
+      if (hint) {
+        hint.style.display = 'block';
+        hint.textContent = 'Needs SharedArrayBuffer — ' + why +
+                           '. Run `python3 serve.py`, then open http://127.0.0.1:8080.';
+      }
+      console.warn('Multithreaded solver unavailable: ' + why +
+                   '. Serve with `python3 serve.py` (adds COOP/COEP) to enable it.');
+      params.mt = false;
+    } else {
+      chkMt.checked = params.mt;
+    }
+    chkMt.addEventListener('change', function () {
+      if (this.disabled) { this.checked = false; return; }
+      params.mt = this.checked;
+      applyMt();
     });
   }
   $('chkVectors').addEventListener('change', function () {
@@ -682,7 +776,7 @@ function frame(now) {
   // alike — so speeding up time spins the planet faster too.
   advanceCelestial(paused ? 0 : dt * params.timeScale);
 
-  if (!paused && dt > 0) {
+  if (!paused && dt > 0 && !stepBusy) {
     solver.gravity = gravityScaled();
     solver.viscosity = params.viscosity;
     solver.pic = params.pic;
@@ -702,8 +796,34 @@ function frame(now) {
       gpuSim.step(dt * params.timeScale).then(function () { dirty = true; })
         .catch(function (e) { console.error('GPU step failed', e); params.gpuSim = false; gpuNotice('step failed'); });
     } else {
-      solver.step(dt * params.timeScale);
-      dirty = true;
+      // multithreaded CPU path steps asynchronously (worker pool + shared
+      // memory): the promise resolves when every worker finished this frame;
+      // rendering waits for the next tick's dirty flag.
+      var r = solver.step(dt * params.timeScale);
+      if (r && r.then) {
+        stepBusy = true;
+        r.then(function () {
+          dirty = true; stepBusy = false;
+          if (mtPending) { mtPending = false; applyMt(); }   // deferred checkbox switch
+        })
+         .catch(function (e) {
+           console.error('MT step failed', e);
+           stepBusy = false; dirty = true;
+           if (mtPending) { mtPending = false; applyMt(); }
+           // pool faulted mid-run: fall back to serial once instead of
+           // error-spamming every frame — the app keeps running
+           if (solver && solver.mtStatus && solver.mtStatus().active) {
+             mtNote = 'worker pool fault — back to single thread';
+             solver.disableMultithreading();
+             var chk = $('chkMt');
+             if (chk) chk.checked = false;
+             params.mt = false;
+             renderBackend();
+           }
+         });
+      } else {
+        dirty = true;
+      }
     }
     simMs = ema(simMs, performance.now() - t0, 0.1);
 
