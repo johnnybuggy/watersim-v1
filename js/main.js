@@ -613,19 +613,20 @@ function bindUI() {
       // (inline hint for the eye, console line for the why).
       chkMt.checked = false;
       chkMt.disabled = true;
+      var proto = (typeof location !== 'undefined' && location.protocol) || '';
       var why = typeof MTPool === 'undefined' ? 'mt/pool.js not loaded'
-        : (location.protocol === 'file:' ? 'file:// has no SharedArrayBuffer'
-           : 'page is not cross-origin isolated (missing COOP/COEP headers)');
-      chkMt.title = 'Multithreading needs SharedArrayBuffer — ' + why +
-                    '. Serve with `python3 serve.py` and open http://127.0.0.1:8080';
+        : (proto === 'file:' ? 'file:// has no SharedArrayBuffer'
+           : 'page is not cross-origin isolated (server sends no COOP/COEP headers)');
+      var fix = proto === 'file:'
+        ? 'Run `python3 serve.py` locally, or deploy with COOP/COEP headers (README "Deploying").'
+        : 'coi-sw.js should add them after a page reload; otherwise set COOP/COEP on the server (README "Deploying").';
+      chkMt.title = 'Multithreading needs SharedArrayBuffer — ' + why + ' ' + fix;
       var hint = $('mtHint');
       if (hint) {
         hint.style.display = 'block';
-        hint.textContent = 'Needs SharedArrayBuffer — ' + why +
-                           '. Run `python3 serve.py`, then open http://127.0.0.1:8080.';
+        hint.textContent = 'Needs SharedArrayBuffer — ' + why + ' ' + fix;
       }
-      console.warn('Multithreaded solver unavailable: ' + why +
-                   '. Serve with `python3 serve.py` (adds COOP/COEP) to enable it.');
+      console.warn('Multithreaded solver unavailable: ' + why + ' ' + fix);
       params.mt = false;
     } else {
       chkMt.checked = params.mt;
@@ -869,9 +870,10 @@ function frame(now) {
     qualityStatus();
     $('stFps').textContent = fpsEma.toFixed(0);
     $('stSim').textContent = simMs.toFixed(1);
-    var be = $('stBackend');
-    if (be) be.textContent = (gpuSim && gpuSim.ready && gpuSim.solver === solver && params.gpuSim) ? 'GPU · WebGPU' : 'CPU · fallback';
-    renderBackend();   // keeps the explicit badge in sync (GPU vs CPU fallback + reason)
+    // renderBackend owns both backend labels (GPU / MT threads / serial + why);
+    // the old hard-coded 'CPU · fallback' here overwrote it every 0.3 s and
+    // never reflected the worker pool — the badge seemed stuck on fallback.
+    renderBackend();
     $('stParticles').textContent = solver.nP.toLocaleString();
     $('stAir').textContent = solver.airborneCount;
     $('stVapor').textContent = (solver.vaporCount || 0) + ' / ' + (solver.nightVaporCount || 0);

@@ -4,6 +4,28 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WaterSim 3D — Navier–Stokes Planet Ocean</title>
+  <script>
+  // Cross-origin isolation bootstrap: the worker pool needs SharedArrayBuffer,
+  // which browsers only grant to pages served with COOP/COEP headers. When the
+  // host cannot send them (GitHub Pages, S3, plain static hosting), this
+  // registers coi-sw.js — a service worker that injects the headers — and
+  // reloads once. Skipped when already isolated, on file://, or insecure
+  // origins (service workers need a secure context).
+  (function () {
+    if (self.crossOriginIsolated) return;
+    if (!navigator.serviceWorker) return;
+    var secure = location.protocol === 'https:' ||
+                 location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    if (!secure) return;
+    if (sessionStorage.getItem('coiReloaded')) return;   // one retry only
+    navigator.serviceWorker.register('coi-sw.js', { scope: './' }).then(function () {
+      navigator.serviceWorker.addEventListener('controllerchange', function () {
+        sessionStorage.setItem('coiReloaded', '1');
+        location.reload();
+      });
+    }).catch(function () { /* no worker — stay serial */ });
+  })();
+  </script>
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -11,7 +33,7 @@
 
   <!-- explicit physics-backend label: what actually integrates the solver
        this frame — WebGPU compute, or the fallback CPU solver (and why) -->
-  <div id="solverBadge" class="fallback">Physics: CPU fallback &middot; WebGPU off (experimental)</div>
+  <div id="solverBadge" class="fallback">Physics: CPU &middot; single thread</div>
 
   <div id="loading"><div class="spinner"></div><div id="loadingText">filling the ocean&hellip;</div></div>
 
