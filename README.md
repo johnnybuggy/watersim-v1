@@ -14,7 +14,7 @@ mesh) and tinted by a **color picker** (dark brown by default).
 
 Everything runs locally in the browser — no build step, no network needed.
 
-<img width="1800" height="1442" alt="image" src="https://github.com/user-attachments/assets/b6d361d8-3d1f-4f9c-8f9f-23503dddd287" />
+<img width="2056" height="1502" alt="image" src="https://github.com/user-attachments/assets/4a1b2528-bc03-4c87-b5e9-fa9c35f73aeb" />
 
 ## Run it
 
