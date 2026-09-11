@@ -9,13 +9,12 @@ splashes over beaches — built on a real fluid-dynamics solver: the
 (MAC) grid, with the liquid volume carried by **FLIP particles**, the free
 surface extracted by **marching tetrahedra**, and rigid balls coupled to the
 fluid through **Archimedes' buoyancy** and moving-solid boundary conditions.
-The planet itself is **gouraud-shaded** (per-vertex lighting on the voxel
-mesh) and tinted by a **color picker** (dark brown by default).
+The planet itself is **gouraud-shaded** (per-vertex lighting on the
+isosurface mesh) and tinted by a **color picker** (dark brown by default).
+A **🌍 Earth mode** button auto-tunes the sun and the phase thresholds until
+the climate settles at roughly 100 : 10 : 1 liquid : ice : vapor.
 
 Everything runs locally in the browser — no build step, no network needed.
-
-<img width="1028" height="751" alt="Screenshot 2026-09-10 at 10 15 14" src="https://github.com/user-attachments/assets/19ef7ca4-7903-4a32-a012-5b57922959d0" />
-
 
 ## Run it
 
@@ -28,17 +27,9 @@ Optionally serve it instead:
 python3 -m http.server 8000     # then open http://localhost:8000
 ```
 
-To run with the **multithreaded solver** (worker pool over all cores), serve
-with the cross-origin-isolation headers so the browser exposes
-`SharedArrayBuffer`:
-
-```bash
-python3 serve.py 8080           # then open http://127.0.0.1:8080
-```
-
-The stats badge then reads "Physics: CPU · N threads". Plain `file://` (or a
-server without COOP/COEP headers) silently falls back to the serial solver —
-same physics, one thread.
+`python3 serve.py 8080` serves the repo with dev-friendly cache headers
+(a plain static server works too). The physics runs **on the CPU, single
+threaded** — the stats badge reads "Physics: CPU · single thread".
 
 **Interactions**
 
@@ -46,8 +37,47 @@ same physics, one thread.
 |---|---|
 | Left-drag / wheel | Orbit / zoom camera |
 | **Alt + drag** | Stir the water with a virtual hand |
-| Buttons | Pause · Reset water · Clear balls |
+| Buttons | Pause · Reset water · Clear balls · 🌍 Earth mode |
 | Keys | `Space` pause · `R` reset · `S` splash · `B` ball · `V` velocity vectors · `P` particles |
+
+The temperature chart marks the three phase thresholds on its axis — a
+**C** tick (light grey) at the cloud point, **R** (blue) at the rain point
+and **S** (white) at the snow point, all tracking the sliders live. Two more
+thresholds live in the same fold: the **Ice melt point** (ice melts back only
+when heated 5 % above it, and it can never sit below the snow point) and the
+**Evaporation point** (water leaves the sea only when heated 5 % above it).
+
+The starfield is prominent by default (denser, larger, brighter layers) and
+the *Star brightness* slider (0–2) dims or boosts it further.
+
+The control panel is **fully collapsible** — it starts collapsed (on a phone
+it would cover most of the screen); tap the ☰ button (top-left) or press
+**Tab** to open it, ✕ or Tab to close.
+
+## Visualization controls
+
+**Motion blur** (panel slider, 0–95%) — a frame-blend (afterimage) pass:
+the scene renders into an offscreen buffer that is composited with last
+frame's composite (`history = max(current, previous × damp)`) and blitted to
+screen. Fast orbit moves, spray and swirl leave decaying trails; the current
+frame is never dimmed by history and the feedback converges. At 0% the pass
+is skipped entirely (and its buffers freed) — normal multisampled rendering.
+While active, rendering goes through the blend buffers, so hardware MSAA
+does not apply to those frames. `test/scene_fx.test.js` covers the
+buffer lifecycle, the ping-pong routing and the decay math headlessly.
+
+**Particle temperature chart** (bottom-right HUD, beside the stats block) —
+a live histogram of `solver.pT` (36 bins over the solver's normalized 0–1.2
+temperature scale) with two series: liquid water (blue) and evaporated
+vapor (`pflag === 2`, amber). Redrawn on the 0.3 s stats tick; hidden when
+the canvas is absent. Useful for watching day/night cooling, sun-lit
+surface heating, and night-side condensation of the vapor population.
+
+**Stars** (checkbox + brightness slider) — a three-layer starfield
+(~1,800 points: faint dust, mid field, and a few additive glow sprites)
+with per-star color temperature (white / blue-white / warm / amber) and a
+subtle per-layer twinkle. It sits inside the sky dome and rescales with the
+planet, so giant worlds keep their sky.
 
 ## The physics
 
@@ -122,11 +152,16 @@ into rolling hills and sharp crests. A binary-searched offset tunes the
 height field so **~27 % of directions clear sea level** at the default ocean
 depth — continents and archipelagos surrounding real basins. The field is
 sampled onto a **voxel lattice** (half the grid spacing) that stores both a
-rock/no-rock flag and the continuous radius; the fluid grid marks a cell
-SOLID iff the voxel at its center is rock, and every particle placement /
-push-out uses the *same cell rule*, so the water and the rasterized world
-always agree — fill day has nothing to fix and the ocean starts
-mirror-calm. Placement itself carries a **generation guarantee**: every
+rock/no-rock flag and the continuous radius. The raw field is then
+**Laplacian-smoothed** (1–3 resolution-scaled passes over an 18-neighbor
+stencil, volume-preserving), which removes the rough stair steps the raw
+noise leaves on slopes; a **corner-lattice signed field** (`field[c] =
+R_smoothed(corner) − |corner − center|`, trilinearly interpolated from the
+node radii) carries the same surface as continuous signed distances. The
+fluid grid marks a cell SOLID iff the smoothed voxel at its center is rock,
+and every particle placement / push-out uses the *same cell rule*, so the
+water and the rasterized world always agree — fill day has nothing to fix
+and the ocean starts mirror-calm. Placement itself carries a **generation guarantee**: every
 fill candidate is rejected if it lands inside a rock cell *or inside a
 solid terrain voxel* (the drawn mesh is the voxel surface, finer than the
 cell rule), so no water particle is ever born inside the planet. Seeded
@@ -149,7 +184,7 @@ the active detail preset's particle count (the default ×3 is the shipped
 ocean). Sea level stays put; the ocean adapts instead: particle spacing
 coarsens or refines with the count (`s = ∛(V/N)`) and the auto-calibrated
 iso-threshold keeps the meshed volume equal to the true water volume at any
-count. *Bumpiness* (0–2, shipped default 0.25) scales all relief: near 0 the
+count. *Bumpiness* (0–2, shipped default 0.15) scales all relief: near 0 the
 planet morphs into an **almost perfect voxel sphere** wrapped in a uniform
 shallow sea (rock surface within one voxel step of the sphere radius), from
 ~0.3 up the ridge/erosion octaves open it into continents — smooth sill to
@@ -184,7 +219,8 @@ The sun is **fixed**. The planet **revolves around it** — one "year" every
 20 minutes by default (*Year — orbit around the Sun* slider) — and **spins
 about its vertical axis**, one "day" every 5 minutes by default (*Day —
 spin about its axis* slider). The spin axis can be **tilted against the
-orbital axis** (*Axial tilt* slider, 0–45°, shipped default 30°): the tilt
+orbital axis** (*Axial tilt* slider, 0–45°, shipped default 23.5° — Earth's
+own axial tilt): the tilt
 is applied as a fixed
 world-space lean on a group wrapping the spinning planet, so — exactly like
 Earth — the axis keeps pointing at the same patch of sky while the planet
@@ -212,7 +248,8 @@ drive a per-particle thermal model:
   of the sun (the night side, or buried deep) radiates faster, so darkness
   actively cools. The same knob drives evaporation (below), so sun activity
   is the single dial for the whole water cycle.
-- **Conduction** ("Heat conductivity" slider): conservative cell-aggregate
+- **Conduction** ("Heat conductivity" slider, shipped default **1.2**):
+  conservative cell-aggregate
   diffusion with equal/opposite neighboring-cell energy flux and intra-cell
   relaxation. It replaces dense particle-pair scans with O(particles + cells)
   work; conduction alone preserves total heat. This is a grid-scale model.
@@ -253,16 +290,25 @@ immediately falling back into its source basin. This is a stylized parcel
 circulation model, not a compressible atmosphere solver. Vapor condenses on
 liquid contact and rains out when cold.
 
-**Evaporation probability grows exponentially between the planet's coldest and
-hottest water temperatures**: every thermal tick scans the liquid's Tmin/Tmax,
-and a surface parcel at temperature T leaves with probability
-`rate · e^{5(τ−1)}` where `τ = (T−Tmin)/(Tmax−Tmin)` — the sun-warmed day side
-boils off briskly while the night side and deep shade evaporate too, just far
-more slowly. The **Sun activity** slider scales the rate (and the heating).
+**Evaporation is gated by the *Evaporation point* and grows exponentially
+between the coldest and hottest *eligible* water**: water leaves the sea only
+when heated to 5 % **above** the *Evaporation point* slider (shipped default
+**0.40** → the gate sits at 0.42); every thermal tick scans the eligible
+liquid's Tmin/Tmax, and a surface parcel at temperature T leaves with
+probability `rate · e^{5(τ−1)}` where `τ = 1 − (Tmax−T)/(Tmax−Tmin)` — the
+hottest eligible parcel always has τ = 1, the sun-warmed day side boils off
+briskly while cooler water evaporates far more slowly. The **Sun activity**
+slider scales the rate (and the heating).
 
 Vapor parcels **collide and repel each other** — overlapping pairs swap
 normal velocity components and get pushed apart with a short repulsion
-impulse, so the atmosphere occupies volume instead of interpenetrating —
+impulse, so the atmosphere occupies volume instead of interpenetrating — and
+they **collide with liquid water physically**: droplets, rain and the sea
+surface itself act as moving boundaries that airborne parcels bounce off
+(the parcel reflects with restitution 0.4 and a small buoyant kick; the sea
+is an effectively infinite-mass bath and is never pushed), so rain driving
+into the sea or spray skimming its surface transfers momentum to the
+atmosphere instead of ghosting through. They also
 **bounce off terrain** (inward radial motion reflects outward, damped), and
 **reflect from the atmosphere ceiling stochastically**: the higher the parcel,
 the more likely it bounces. The *Vapor ceiling reflection* curve is chosen by
@@ -286,15 +332,106 @@ simulation). The
 chance and lowers the density threshold together — from rare single bolts to
 frequent widespread storms. Vapor
 renders as **broad, low-opacity Gaussian cloudlets**, softly overlapping into
-atmospheric wisps.
+atmospheric wisps. Fresh parcels leave the surface **no-slip**: they keep the
+surface's normal motion, adopt the local *tangential* flow of the surface at
+the generation site (the MAC-grid velocity projected onto the tangent plane),
+then add the thermal kick on top.
+
+With **Particles rotation** enabled (checkbox, or `R`), every airborne parcel
+(steam + cloud) carries an angular velocity — a rotation axis and speed seeded
+thermally at evaporation (random axis, speed ∝ √T). Collisions become
+**frictional**: the surface slip at the contact point
+`u = (v₁−v₂) + R·(ω₁+ω₂)×n̂` drives a Coulomb-capped impulse that converts
+linear motion into spin (and vice versa) — the natural billiard-ball
+redistribution, with the residual dissipated. Momentum is conserved exactly;
+mechanical energy never increases. Rotation also shows as a subtle brightness
+pulse on the parcel sprite (the spin phase), and damps gently in the air.
 
 Airborne water sheds heat fast: its ambient is the sky — mild by day,
 near-freezing in shade and after sundown. When it cools below the dew point
 it **condenses**: the droplet sheds its vapor motion entirely (speed drops to
 zero) and free-falls onto the planet, where the existing spray rules take
 over — gravity, terrain contact, beaching into puddles that run downhill to
-the ocean or pool into lakes. Water mass is conserved across all three
-statuses (fluid / droplet / vapor).
+the ocean or pool into lakes. Water mass is conserved across all six
+statuses (fluid / droplet / steam / cloud / rain / snow).
+
+#### Clouds, rain & snow — evaporated-particle substates
+
+Evaporated particles are a small state machine, evaluated once per frame:
+
+* **steam** (the normal state above) condenses into a **cloud** particle when
+  it is colder than the *Cloud point temperature* **and** the surrounding
+  steam density — a pressure proxy counted over the particle's 3×3×3 cell
+  neighbourhood — reaches the *Cloud point pressure*. Cloud formation is
+  gated above 30 % of the atmosphere height so coastal fog does not condense
+  directly onto the sea surface. Clouds ride the same winds as steam, render
+  as **light grey, almost solid circles** (their own near-opaque sprite), and
+  burn off back to steam when warmed past the cloud point again. Only
+  *steam* produces rain — a cloud never rains out; it persists until the sun
+  warms it or the sea absorbs it.
+* **rain**: steam colder than the *Rain point temperature* sheds its lift and
+  falls as a water droplet (rendered like spray droplets, landing by the
+  usual spray rules). Rain that cools further freezes.
+* **snow**: water at a fluid–air interface (sea/pond surface — deep water
+  cannot shed its latent heat to the sky) or rain colder than the *Snow point
+  temperature* freezes solid: **static white discs**, the same size as water
+  droplets, with only a slight radial transparency gradient along the edge.
+  Ice is **adhesive**: sea ice and any grain that touches terrain is *stuck*
+  — it never moves again (the terrain-rescue pass leaves it alone) — while
+  freezing rain stays *free*: it flutters down under gravity with strong drag
+  until it touches terrain (→ sticks), reaches the liquid, or meets another
+  grain. Free grains that touch each other pair up inelastically (mean
+  velocity) and a free grain touching a stuck one aggregates onto the pack,
+  so snow accumulates. **Ice floats: a free grain that lands on water is
+  marched radially outward to the sea surface and parks there as a raft —
+  it never sinks into the water column.** When ice warms past the *Ice melt
+  point* (which always sits 5 % above the snow point) it melts — back into
+  the liquid where it floats in water, into a falling droplet when it thaws
+  mid-air.
+
+The thresholds live in the **Clouds & precipitation** subsection of the
+control panel (cloud point + pressure, rain point, snow point, **Ice melt
+point**, **Evaporation point**). The solver keeps them ordered regardless of
+slider positions (snow ≤ rain − 0.02 ≤ cloud − 0.02), and steam that never
+received a thermal update (temperature exactly 0) is never treated as
+absolute-zero cold.
+
+#### Earth mode — one button, a temperate climate
+
+The **🌍 Earth mode** button (top of the panel) runs a small climate
+controller: every ten simulation steps it takes a census of the particle
+population — **liquid** (water + spray + rain), **ice** (snow, stuck or
+rafting) and **vapor** (steam + cloud) — and nudges the climate knobs toward
+a temperate target of **100 : 10 : 1** (±10 % per fraction):
+
+- a vapor deficit raises **Sun activity** (capped rate), then cools the
+  **Evaporation point** once the sun saturates; a vapor surplus reverses;
+- an ice deficit raises the **Snow point** (easier freezing), with the
+  **Ice melt point** following at 5 % above it; far too much ice also walks
+  the melt point downward and adds thaw heat;
+- the ordered chain snow ≤ rain − 0.02 ≤ cloud − 0.02 is preserved through
+  every nudge, and all sliders move live so the panel always shows the
+  current tuning.
+
+Every nudge is **damped** (at most a few hundredths per census) — freezing
+is a hair trigger while thawing and evaporating are slow, so overshoot would
+ratchet the climate between "all liquid" and "all ice". An ice surplus also
+lowers the whole freeze/melt band (ice thaws only by *warming* past the melt
+point — daylight then does the thawing) and adds thaw heat. Axial tilt is
+pinned to **23.5°** when the mode starts. The controller stops when the
+census first lands inside the tolerance band, or after **1500 simulation
+steps**; the button reports the best census reached either way.
+
+How far the tuning gets depends on the world's thermal physics. Large
+planets at the shipped defaults cool steadily (their deep water radiates
+faster than the sun reheats it) and their day/night cycle is slow, so the
+knobs can saturate before the target window holds on every fraction — the
+button then reports the best census reached (e.g. `Earth mode stopped after
+1500 steps: liquid 62.0% · ice 37.2% · vapor 0.8%`). Warmer, smaller or
+better-insulated worlds (raise *Heat conductivity*, deepen the ocean) give
+the controller room to settle the full 100 : 10 : 1. The controller never
+fights the user: clicking the button again stops the tuning immediately and
+leaves the current settings in place.
 
 ### 4. Ocean dynamics — subsurface streams & whirling
 
@@ -323,14 +460,12 @@ both default-on in the UI, off in the headless library):
 
 ### 5. Rendering the planet — natural voxels, glossy water
 
-The rock is meshed directly from the voxel field: only faces between rock and
-air are emitted, and each mesh **corner averages the normals of every face
-touching it** (degenerate corners — where opposing faces cancel — fall back
-to the radial direction, so no vertex ever renders black) — the classic
-gouraud trick that melts the voxel staircase into soft, eroded-looking hills
-while the collision below stays exactly voxel. The skin is
-`MeshPhongMaterial` (matte, weathered rather than plastic) with
-per-vertex **elevation palette** measured from the planet's center:
+The rock is contoured from the corner field by **marching tetrahedra**
+(the same mesher the water uses), so the rendered hills are smooth slopes —
+not voxel staircases — while staying within a fraction of a voxel step of
+the collision surface. Each mesh **vertex averages the normals of every
+triangle touching it**, and the per-vertex **elevation palette** is measured
+from the planet's center:
 
 - **under water** — the rock hue darkened and pulled to a brown-grey;
 - **the waterline belt** — warm sand beaches, then green lowlands;
@@ -339,13 +474,12 @@ per-vertex **elevation palette** measured from the planet's center:
 - **high ground** — bleaching to snow white on the peaks.
 
 Coherent spatial color variation and latitude-dependent snow keep the palette
-natural while all geometry remains on the voxel lattice. The night side is
-dim. A small night fill keeps transported clouds perceptible.
-The atmosphere-height slider (shipped default **1.65 m**, spanning up to
-**20 m**) sets the physical ceiling without rebuilding terrain; the ceiling
-is honored even above the simulation shell (the shell only has to contain
-the ocean and its terrain). The additive limb **halo is hidden** — the
-atmosphere reads through its vapor and lighting alone.
+natural. The night side is dim. A small night fill keeps transported clouds
+perceptible. The atmosphere-height slider (shipped default **5.4 m**, the
+same relative height Earth's atmosphere has over its radius, spanning up to
+**20 m**) sets the physical ceiling without rebuilding terrain. The additive
+limb **halo is hidden** — the atmosphere reads through its vapor and lighting
+alone.
 
 Water is a **continuous semi-transparent physical-material surface**, with
 low roughness, environment reflections, clearcoat and subtle animated normal
@@ -355,34 +489,48 @@ self-tint at 0.24 × the water color**, plus a shader **alpha pre-boost**
 the near-black sky, so the translucent body always renders as a saturated
 blue. The water-opacity slider (shipped default **25 %**) is independent of
 spray/cloud opacity. Only detached droplets and vapor draw as particles: the
-liquid body no longer looks like overlapping beads. The rain/spray droplets
-themselves are clearly visible at every size — glossy sphere-shaded sprites
-with a baked specular hotspot, a higher default opacity (50 %) and a faint
-night-side floor (12 % of full brightness) keep them readable without
-glowing in the dark. The
-**Water beads** checkbox (**enabled by default**) flips to a separate display
-mode where the liquid body renders *exclusively* as **flat blue circles** — a
-hard-edged, evenly transparent disc sprite with no gradients, and no
-isosurface mesh (the marching-tets pass is skipped entirely): pure display
-switch, physics untouched. Every circle is tinted with the water color and
-darkened by the solver's per-particle sun exposure, so the night side falls
-into **true planet shadow** instead of glowing. In that
-mode the circles ARE the water surface, so their
-transparency follows the *Water surface opacity* slider on its own draw call,
-while the detached **glossy rain droplets** (⅓ the circle diameter) and
-vapor keep following the spray/atmosphere slider. Night side, terrain shade
-and underwater depth all render dim.
-The water picker tints
-both surface and rain. The **Water velocity vectors** checkbox overlays
-arrows on grid-coupled water particles showing the **moving average of the
-last 5 simulation steps** (a 5-slot per-particle velocity ring in the scene,
-re-keyed whenever the solver is rebuilt; stride-sampled, capped at 9,000
-lines): direction = averaged velocity,
-length ∝ averaged speed, color ramping calm blue → white with speed. This
-uses alpha translucency, not expensive
-screen-space refraction, and transparent cloudlets use approximate layer
-ordering rather than full volumetric rendering. The sun and particles
-depth-test against the terrain.
+liquid body no longer looks like overlapping beads.
+
+**Every particle — spray, rain, steam, cloud and snow — draws from ONE
+combined, camera-sorted system.** Each particle carries a sprite-tile index
+into a small atlas (flat disc, glossy droplet, steam cloudlet, cloud puff,
+snowflake — uploaded row-major, `flipY = false`, so each class samples
+exactly its own tile), a per-particle opacity and a sun-exposure-tinted
+color; all five
+attributes are refilled each frame in **far-to-near painter order** — a
+single O(n) 64-bucket counting sort on camera-relative depth, no per-frame
+allocations. Because the sort is global, a spray droplet near the camera is
+correctly drawn *after* a snow grain farther away — no class ever occludes a
+nearer one, and alpha-blended classes (cloud, vapor) composite in a stable
+order. Particles depth-test against the terrain (the far side of the planet
+hides behind the rock) but never write depth, so translucent puffs stack.
+The rain/spray droplets are glossy sphere-shaded sprites with a baked
+specular hotspot; **ice never follows the opacity sliders** — snow grains
+render as flat, fully opaque white discs the size of water beads (three
+times the droplet diameter); steam and cloud puffs are soft, larger and
+fainter. The **Water beads** checkbox (**enabled by default**) flips the
+display mode so the liquid body renders *exclusively* as **flat blue
+circles** (atlas tile 0) — no isosurface mesh, pure display switch, physics
+untouched. Every circle is tinted with the water color and darkened by the
+solver's per-particle sun exposure, so the night side falls into **true
+planet shadow** instead of glowing; in that mode the circles ARE the water
+surface, so their transparency follows the *Water surface opacity* slider.
+On the **sunny side** of the planet every water circle draws with its
+**normal color** — the sun lights the whole column, so no particle there is
+ever treated as "interior" or darkened. On the **night side** only the
+visible **surface shell** draws — water two or more cells below the local
+surface is skipped (the solver mirrors its overhead-water count per
+particle) — so the interior never peeks through as dark speckle and the
+darkened shell forms the true planet shadow.
+Night side, terrain shade and underwater depth all render dim.
+The water picker tints both surface and rain. The **Water velocity vectors**
+checkbox overlays arrows on grid-coupled water particles showing the
+**moving average of the last 5 simulation steps** (a 5-slot per-particle
+velocity ring in the scene, re-keyed whenever the solver is rebuilt;
+stride-sampled, capped at 9,000 lines): direction = averaged velocity,
+length ∝ averaged speed, color ramping calm blue → white with speed.
+Particles rotation (each droplet carries an angular phase driven by the
+local vorticity) is **enabled by default**.
 
 ### 6. Surface reconstruction
 
@@ -434,65 +582,26 @@ submerged = ρ_ball/ρ_water exactly).
   sim time; the dry percentage (land with no water sitting on it — beached
   puddles count as wet) shows in the stats panel.
 
-## Troubleshooting
+## Deploying
 
-**The "Multithreaded solver" checkbox is disabled** — the worker pool needs a
-shared-memory `SharedArrayBuffer`, which browsers only grant to
-*cross-origin isolated* pages (COOP/COEP headers). CPU core count plays no
-role in this. Open the app through the bundled server:
-
-```
-python3 serve.py          # adds Cross-Origin-Opener-Policy / Embedder-Policy
-# then visit http://127.0.0.1:8080
-```
-
-On `file://` or any static server without those headers the checkbox greys
-out, an inline hint under it explains why, and the solver stays on the serial
-path (by design — the page still runs). If the pool faults at runtime (worker
-load failure), the app logs `MT step failed` once, unchecks the toggle, and
-continues on the serial path instead of erroring every frame.
-
-## Multithreading
-
-`enableMultithreading(threads)` re-binds the solver's fields onto a
-`SharedArrayBuffer` and spawns a worker pool (`js/mt/pool.js`) with one worker
-per requested thread plus the coordinator, which runs its own chunk inline so
-every core is busy. Each stage of the step is dispatched as a *job* over the
-mailbox control buffer (`js/mt/pool.js` ↔ `js/mt/node-worker.js` /
-`web-worker.js`); the worker executes its chunk of the task against the shared
-state through a view of the same typed arrays.
-
-- **Stage slicing** — particle stages (mark, P2G, G2P, advect, heat, evaporate)
-  partition linearly; grid stages (BC, gravity, projection, velocity clamp)
-  slice by k-planes. Stages that share an index space and don't cross-slab
-  read ride in one dispatch (e.g. gravity + the boundary re-clamp, or
-  mark + push-balls + P2G).
-- **Barriers** — Node uses an `Atomics.wait`/`notify` mailbox so the whole
-  step stays synchronous (the headless tests run the MT path unchanged); the
-  main-thread barrier spins through the short completion window and parks
-  bounded only past it (a macOS `Atomics.wait` wake costs milliseconds).
-  Workers adaptively spin during dispatch bursts and back off to deep sleeps
-  while idle. Browsers can't `Atomics.wait` on the main thread, so the same
-  dispatches run as promises (`step()` then-able) and the render loop waits
-  for completion.
-- **Determinism** — per-chunk stochastic streams (vapor advection,
-  evaporation) are seeded per (seed, task, worker, tick), so repeated runs at
-  a fixed thread count are bit-identical (`test/mt.test.js` asserts it).
-  Particle velocities diverge from the serial path at float-roundoff scale
-  (~1e-7 m/s after 120 frames); grid fields match the serial solver exactly.
-- **Serial stays the contract** — without `SharedArrayBuffer`/workers, or
-  with the toggle off (`Multithreaded solver` checkbox) or the GPU solver
-  enabled, `step()` runs the original serial path.
+The whole app is static — any static file server works:
 
 ```bash
-node test/mt.test.js            # pool lifecycle, serial↔MT parity, determinism, invariants
-node .bench/mt_compare.js 60    # speedup table: serial vs 2/4/6/(cores-1) threads
+python3 serve.py 8080           # repo root with no-cache dev headers
+python3 -m http.server 8000     # or any plain static server
 ```
 
-On an M1 Max the pool measures ~2× at 4–6 threads on the auto-detail preset
-(the per-dispatch mailbox round trip dominates on small grids — larger
-resolutions and particle counts scale further; the physics is identical at
-every thread count).
+No special headers are needed: the physics is CPU-only, and Three.js r128 is
+vendored. (`index.html` still registers `coi-sw.js`, a service worker that
+injects cross-origin-isolation headers on hosts where they are available —
+it is optional and harmless.)
+
+## Troubleshooting
+
+**Performance** — the physics runs on one thread; pick a smaller detail
+preset (the panel's *Detail* selector) if the frame rate drops. The auto
+calibration (`Recalibrate target`) measures your actual hardware and picks
+the highest preset that fits your frame budget.
 
 ## Architecture
 
@@ -500,33 +609,36 @@ every thread count).
 index.html          UI shell (control panel, stats, help)
 css/style.css       dark glass styling
 js/solver.js        the Navier–Stokes FLIP solver (no dependencies)
-js/mt/tasks.js      worker-side task registry (stage codes, chunk runners)
-js/mt/pool.js       worker pool: mailbox dispatch, barriers, reductions
-js/mt/node-worker.js   worker entry: Node worker_threads (sync mailbox)
-js/mt/web-worker.js    worker entry: browser Web Workers (async)
 js/surface.js       marching-tetrahedra isosurface + volume integral
 js/controls.js      minimal orbit camera
-js/scene.js         Three.js planet scene (voxel terrain, atmosphere, starfield, lights)
-js/main.js          loop, UI wiring, stir/splash interactions, hardware calibration
+js/scene.js         Three.js planet scene (terrain isosurface, combined particle atlas, starfield)
+js/main.js          loop, UI wiring, Earth-mode controller, stir/splash, calibration
 js/quality.js       frame-budget policy and adaptive render-scale controller
 vendor/three.min.js Three.js r128 (vendored, works offline)
-serve.py            static server with COOP/COEP (enables SharedArrayBuffer)
-test/solver.test.js headless physics tests (node)
+serve.py            static dev server (no-cache headers)
+test/               headless node test suite (see Tests)
 ```
 
 ## Tests
 
 ```bash
-node test/solver.test.js
-node test/atmosphere.test.js
-node test/optimization.test.js
-node test/scene.smoke.js
-node test/surface.test.js
-node test/quality.test.js
-node test/main.test.js
-node test/mt.test.js        # multithreaded solver: parity, determinism, invariants
+node test/solver.test.js    # fill, stability, buoyancy, thermal, ocean dynamics, scaling
+node test/atmosphere.test.js# evaporation, condensation, rain-out, mass conservation
+node test/optimization.test.js # solver invariants after the optimization passes
+node test/scene.smoke.js    # headless scene construction + combined particle system
+node test/surface.test.js   # marching-tets volume conservation + normals
+node test/quality.test.js   # detail presets + frame-budget policy
+node test/main.test.js      # app loop, UI wiring, Earth-mode knobs
+node test/phase.test.js     # substate machine + particle rotation friction + ice adhesion
+node test/scene_fx.test.js  # motion blur, starfield, combined-sprite ordering (headless)
 node test/performance.js    # CPU step + surface benchmark, three presets
 node test/browser.test.js   # optional: local Chrome, real WebGL + screenshots
+
+The browser test spawns its own headless Chrome with a throwaway temp profile
+and a pipe transport (no debugging port) — it never touches a browser you are
+running, kills only the child it started (even on Ctrl-C or timeout), and
+removes its temp profile afterwards. No test ever signals Chrome processes
+system-wide.
 ```
 
 Validates the solver headlessly, in both its domains: pool-mode fill
@@ -579,22 +691,16 @@ steps, 1/60 s simulated per step; timings are CPU work, **not FPS**):
 | Medium | 60,149 | 54.92 ms | 32.89 ms |
 
 These are representative local results; use the benchmark to remeasure on
-your hardware. Surface extraction and GPU work are additional costs. A real
-headless-Chrome run selected Tiny (22³) for the 50 FPS target, running near
-60 FPS, and Balanced (26³) for the 25 FPS target. Selection varies between
-runs; each slower displayed frame also needs more physics substeps. The run
-had 4,110 vapor parcels, 2,538 on the night hemisphere
-after roughly 16 seconds. A deterministic day-origin cohort test also checks
-transport before condensation and eventual rain-out after global nightfall.
-Browser tests compile shaders and capture screenshots, but screenshot visual
-inspection was unavailable in this agent session.
+your hardware. Surface extraction and rendering are additional costs. A
+deterministic day-origin cohort test also checks transport before
+condensation and eventual rain-out after global nightfall.
 
 Manual presets ship as the default (**Medium — 40³**). **Auto detail —
 50 FPS / 25 FPS** measures increasing tiers on your own
 browser, from Eco (18³ / 10k target particles) through Extreme (72³ / 220k).
 Each tier includes terrain, particle simulation, surface reconstruction,
 render scale and shadows. After eight warmup frames, 24 samples measure a
-full simulation + mesh + completed GPU render; the 90th-percentile cost must
+full simulation + mesh + completed render; the 90th-percentile cost must
 fit within 80% of a refresh-aware budget. Twelve idle RAF intervals estimate
 the display cadence; on 60 Hz, the 50 FPS target budgets for 60 FPS and the
 25 FPS target for 30 FPS (13.3 / 26.7 ms with the reserve). This avoids
@@ -609,71 +715,17 @@ an automatic quality change. Sustained overload reduces render scale; six
 seconds of headroom gradually restore it. Use **Recalibrate target** after
 changing physics settings or window size. This deliberately does not lower
 pressure accuracy or skip simulation work to manufacture an FPS number.
-GPU synchronization is used only during calibration, never during normal play.
 
 FPS reports actual, unclamped frame intervals (including below 30 FPS).
 Only simulation time is capped after long stalls. Paused water reuses its
-surface geometry. Water/spray GPU uploads use their live draw ranges instead
-of entire oversized backing arrays. `window.waterSimPerformance` exposes
-calibration results and `window.waterSimStats` exposes current timing.
+surface geometry. The combined particle system refills only its live draw
+range instead of entire oversized backing arrays. `window.waterSimPerformance`
+exposes calibration results and `window.waterSimStats` exposes current timing.
 
 Targets are not guarantees: display refresh, thermal throttling, other apps,
 vapor growth, splashes and high time scales can change the budget. Manual
 resolution presets remain available; the 25 FPS mode typically permits more
 detail but also simulates more substeps per displayed frame.
-
-## GPU solver — WebGPU compute
-
-The physics solver itself can run as WebGPU compute (the WebGL renderer is
-untouched). `js/gpu/shaders.js` is a hand-written WGSL port of the CPU solver
-pipeline; `js/gpu/gpusim.js` is the host. **GPU Solver** ships **disabled**
-and is flagged *experimental yet* in the panel; when enabled, it runs wherever
-WebGPU is available and the simulation silently falls back to the CPU
-solver (`js/solver.js`) otherwise — on unsupported browsers, on device loss,
-or if any GPU step fails. The toggle (`GPU solver` in the panel) forces either
-backend. An **explicit badge** (bottom-left of the viewport) always states
-what is actually integrating the solver this frame: `Physics: GPU · WebGPU
-compute`, or `Physics: CPU fallback · <reason>` (WebGPU unavailable, init/step
-failure with details on the console, or toggled off in the panel); the stats
-panel's *physics solver* row mirrors it tersely.
-
-Structure of one GPU step mirrors the CPU one: thermal/evaporation/currents
-tick (~25 Hz), rasterize, P2G scatter, normalization, boundary conditions,
-viscosity, gravity, pressure (red-black SOR), projection, vorticity confinement,
-clamp, extrapolation, G2P, advection, ball coupling; frame-end passes run
-vapor condensation, surface census, density splat and ball velocity probes.
-State lives in two GPU storage slabs — particles + cell scalars (`BP`) and
-MAC face arrays (`BF`) — plus a read-only static buffer (`S`) for voxel
-terrain, planet gravity faces and current wave constants. A small uniform
-table (`O`) maps logical solver fields onto those slabs; the field map and
-documented aliases are listed at the top of `shaders.js`. Uniforms are a
-triple-buffered ring so substeps never serialize on the host. Each frame ends
-with one bulk readback (positions, velocities, temperature, flags, cooling,
-density, counters, ball probes); the solver's JS arrays stay authoritative for
-rendering and statistics.
-
-Documented divergences from the CPU path (behavior-faithful, not bit-identical):
-
-- **Randomness**: the GPU uses a per-particle PCG32 hash stream seeded by
-  particle index + frame, so evaporation/droplet jitter is statistically
-  equivalent but numerically different from the CPU LCG.
-- **Pressure**: red-black SOR (ω=1.55, warm-started `q`) instead of the CPU's
-  in-place iteration order — same equilibrium, slightly different transients.
-- **Viscosity**: Jacobi form reading the pre-projection snapshot, while the
-  CPU updates in place (Gauss-Seidel order).
-- **Vapor/evaporation**: the thermal tick uses the GPU's fixed-point min/max
-  temperature range accumulator; vapor populations track the CPU scale but
-  individual counts differ frame to frame. The GPU ejection kick is still the
-  legacy heat-scaled scheme — the CPU's Maxwell–Boltzmann escape spectrum and
-  barometric buoyancy refactor (floor reflector) are not yet ported, so GPU
-  vapor rides slightly higher than CPU vapor.
-- **Ball velocity probes** are sampled on GPU; integration stays on the host.
-
-Substep scheduling (CFL + 10 ms cap), particle caps, containment (sky-high
-ceiling), and mass bookkeeping are all enforced identically on both paths, and
-the round-4 verification invariants (paused determinism, night-side rain-out,
-containment) hold on either backend. The node suite always exercises the CPU
-solver unchanged; GPU-specific probes live in the smoke/parity scripts.
 
 ## References
 

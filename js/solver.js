@@ -32,22 +32,12 @@
 
 var AIR = 0, FLUID = 1, SOLID = 2;
 
-// Multithreaded-solver modules (soft dependencies: absent -> serial solver).
-// tasks.js carries the chunk-task registry; pool.js the worker-pool host.
-var MTTASKS = null, MTPOOL = null;
-try {
-  MTTASKS = global.MTTasks || (typeof require === 'function' ? require('./mt/tasks.js') : null);
-  MTPOOL = global.MTPool || (typeof require === 'function' ? require('./mt/pool.js') : null);
-} catch (e) { MTTASKS = null; MTPOOL = null; }
-
 function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
 
 function FluidSolver(opts) {
   opts = opts || {};
-  // Field allocator hook: multithreaded mode rebinds every shared field onto
-  // SharedArrayBuffer views so workers execute chunk tasks against the same
-  // memory. `alloc(name, ctor, len)` returning undefined falls back to a
-  // private array. Names are stable (see js/mt/tasks.js layout contract).
+  // Field allocator hook: `alloc(name, ctor, len)` returning undefined falls
+  // back to a plain private array (tests may supply pooled buffers).
   this._alloc = opts.alloc || function (name, ctor, len) { return new ctor(len); };
   this.nx = opts.nx | 0;
   this.ny = opts.ny | 0;
@@ -124,8 +114,16 @@ function FluidSolver(opts) {
   this.pT = this._alloc('pT', Float32Array, 1);    // per-particle temperature (0 cold .. 1 hot)
   this.pAir = this._alloc('pAir', Float32Array, 1);  // time spent evaporated (s) — vapor age
   this.pLight = this._alloc('pLight', Float32Array, 1); // per-particle sun exposure 0 (shade) .. 1 (lit) — display shading
+  this.pDepth = this._alloc('pDepth', Uint8Array, 1);  // water cells stacked over each particle (0 = at/above the surface, 4 = deep) — beads cull
+  this.pWx = this._alloc('pWx', Float32Array, 1); this.pWy = this._alloc('pWy', Float32Array, 1); this.pWz = this._alloc('pWz', Float32Array, 1);
+  // angular-velocity vector of evaporated particles (rad/s, axis × speed in
+  // one vector) + accumulated spin phase (rendering twinkle cue)
+  this.pPh = this._alloc('pPh', Float32Array, 1);
+  this.spinOn = false;               // "Particles rotation" checkbox (UI)
   // particle status codes in pflag: 0 = fluid (grid-coupled), 1 = droplet
-  // (ballistic spray), 2 = evaporated (levitating vapor)
+  // (ballistic spray), 2 = evaporated steam (levitating vapor), 3 = cloud
+  // (condensed steam, rides the winds), 4 = rain (falling condensate),
+  // 5 = snow (frozen — does not move)
   this.terrain = null;              // sphere world: voxel terrain {n,dv,solid,R,Rsl,Rlo,Rhi,Rlo2,Rhi2,landFrac,seed}
   this._terrainKey = null;          // (coreR, sea level, seed) of the built terrain
   this.terrainSeed = (opts.terrainSeed || 20260114) >>> 0;
@@ -150,6 +148,25 @@ function FluidSolver(opts) {
   this.sunPos = null;               // world-space sun position [x,y,z] (null = no sun)
   this.heatK = 0.6;                 // particle-particle heat conductivity
   this.Tamb = 0.32;                 // ambient ocean temperature
+  // ---- phase-change thresholds (UI: "Clouds & precipitation") ------------
+  // steam → cloud needs BOTH: T ≤ cloudT and local steam density (steam
+  // particles per neighbouring cell) ≥ cloudP, above the cloud base
+  // (30% of the atmosphere height — the barometric profile is bottom-heavy,
+  // so without the gate clouds would condense as fog on the sea surface).
+  // steam → rain at T ≤ rainT (ordering-clamped below cloudT); water/rain →
+  // snow at T ≤ snowT (clamped below rainT); melt-back reverses snow.
+  this.cloudT = opts.cloudT !== undefined ? opts.cloudT : 0.34;
+  this.cloudP = opts.cloudP !== undefined ? opts.cloudP : 0.35;
+  this.rainT = opts.rainT !== undefined ? opts.rainT : 0.22;
+  this.snowT = opts.snowT !== undefined ? opts.snowT : 0.10;
+  // melt / evaporate conversion points (Clouds & precipitation sliders).
+  // Conversion needs 5% MORE heat than the phase-equilibrium point: ice
+  // melts at snowT×1.05 (the melt slider may raise it), water evaporates at
+  // evapT×1.05 (evapT 0.40 ≈ the hot-day surface band at shipped sun).
+  this.meltT = opts.meltT !== undefined ? opts.meltT : this.snowT * 1.05;
+  this.evapT = opts.evapT !== undefined ? opts.evapT : 0.40;
+  this._steamCnt = new Int32Array(this.nCells);   // steam density scratch grid
+  this._iceIdx = [];                              // snow contact sweep scratch
   this._hCnt = this._alloc('_hCnt', Int32Array, 1); this._hStart = this._alloc('_hStart', Int32Array, 1);
   this._hCur = this._alloc('_hCur', Int32Array, 1); this._hOrd = this._alloc('_hOrd', Int32Array, 1);
   this._advU = this._alloc('_advU', Float64Array, 1); this._advV = this._alloc('_advV', Float64Array, 1); this._advW = this._alloc('_advW', Float64Array, 1);
@@ -174,12 +191,6 @@ function FluidSolver(opts) {
 
 FluidSolver.prototype._allocParticles = function (cap) {
   if (this.capacity >= cap) return;
-  // A capacity change invalidates the shared-memory layout: drop the pool and
-  // let the next step() re-enable it on the final capacity (fills are rare).
-  if (this._mt) {
-    this.disableMultithreading();
-    this._mtNeedsRestart = true;
-  }
   this.capacity = cap;
   this.px = this._alloc('px', Float32Array, cap); this.py = this._alloc('py', Float32Array, cap); this.pz = this._alloc('pz', Float32Array, cap);
   this.pvx = this._alloc('pvx', Float32Array, cap); this.pvy = this._alloc('pvy', Float32Array, cap); this.pvz = this._alloc('pvz', Float32Array, cap);
@@ -188,6 +199,9 @@ FluidSolver.prototype._allocParticles = function (cap) {
   this.pT = this._alloc('pT', Float32Array, cap);
   this.pAir = this._alloc('pAir', Float32Array, cap);
   this.pLight = this._alloc('pLight', Float32Array, cap);
+  this.pDepth = this._alloc('pDepth', Uint8Array, cap);
+  this.pWx = this._alloc('pWx', Float32Array, cap); this.pWy = this._alloc('pWy', Float32Array, cap); this.pWz = this._alloc('pWz', Float32Array, cap);
+  this.pPh = this._alloc('pPh', Float32Array, cap);
 };
 
 // ----------------------------------------------------------------- terrain
@@ -331,6 +345,115 @@ FluidSolver.prototype.generateTerrain = function (seed, seaLevel) {
     }
   }
 
+  // ---- slope smoothing (post-process) ---------------------------------------
+  // The raw radius field follows the noise exactly; the contoured surface
+  // then shows rough terraced steps. A few Laplacian passes over the radius
+  // field relax the high-frequency terracing into smooth slopes (volume
+  // preserved by rescaling the mean radius), and the solid mask is rebuilt
+  // from the smoothed field so every physics query (_rockCellAt, fill
+  // placement, pushout) agrees with the drawn surface.
+  // relaxation strength scales with lattice resolution: a coarse lattice
+  // (small planets) samples each slope with few voxels, so the same blend
+  // would flatten real landforms — the land fraction must survive.
+  var PASSES = n < 48 ? 1 : (n < 64 ? 2 : 3);
+  var BLEND = n < 48 ? 0.15 : (n < 64 ? 0.35 : 0.5);
+  var sN = n, sN2 = n * n;
+  for (var ps = 0; ps < PASSES; ps++) {
+    for (kv = 1; kv < sN - 1; kv++) {
+      var zBase = kv * sN2, zBaseL = (kv - 1) * sN2, zBaseU = (kv + 1) * sN2;
+      for (jv = 1; jv < sN - 1; jv++) {
+        var yBase = zBase + jv * sN, yBaseL = zBaseL + (jv - 1) * sN, yBaseU = zBaseL + (jv + 1) * sN;
+        var yBase2 = zBaseU + (jv - 1) * sN, yBase3 = zBaseU + jv * sN, yBase4 = zBaseU + (jv + 1) * sN;
+        var yBaseL2 = zBase + (jv - 1) * sN, yBaseU2 = zBase + (jv + 1) * sN;
+        for (iv = 1; iv < sN - 1; iv++) {
+          var iR = yBase + iv;
+          var avg = (R[iR - 1] + R[iR + 1] + R[yBaseL2 + iv] + R[yBaseU2 + iv] +
+                     R[yBaseL + iv] + R[yBase2 + iv] + R[yBase3 + iv] + R[yBase4 + iv] +
+                     R[yBaseL + iv - 1] + R[yBaseL + iv + 1] + R[yBase2 + iv - 1] + R[yBase2 + iv + 1] +
+                     R[yBaseU + iv] + R[yBase3 + iv - 1] + R[yBase3 + iv + 1] + R[yBase4 + iv] +
+                     R[yBaseL2 + iv - 1] + R[yBaseL2 + iv + 1]) * (1 / 18);
+          R[iR] += (avg - R[iR]) * BLEND;
+        }
+      }
+    }
+  }
+  // volume preservation: keep the mean radius the smoothing started with
+  var mean0 = 0, mean1 = 0, cntR = 0;
+  for (idx = 0; idx < R.length; idx += 7) { mean0 += R[idx]; cntR++; }
+  mean0 /= cntR;
+  for (var ps2 = 0; ps2 < PASSES; ps2++) {
+    for (kv = 1; kv < sN - 1; kv++) for (jv = 1; jv < sN - 1; jv++) {
+      var rowS = (kv * sN2 + jv * sN);
+      for (iv = 1; iv < sN - 1; iv++) {
+        var iS = rowS + iv;
+        var avg2 = (R[iS - 1] + R[iS + 1] + R[iS - sN] + R[iS + sN] +
+                    R[iS - sN2] + R[iS + sN2]) * (1 / 6);
+        R[iS] += (avg2 - R[iS]) * BLEND;
+      }
+    }
+  }
+  for (idx = 0; idx < R.length; idx += 7) mean1 += R[idx];
+  mean1 /= cntR;
+  if (mean1 > 1e-9) {
+    var rScale = mean0 / mean1;
+    for (idx = 0; idx < R.length; idx++) R[idx] *= rScale;
+  }
+  // rebuild the solid mask from the SMOOTHED radius (the raw fill used the
+  // unsmoothed radius), and build the renderer's isosurface field on the
+  // CORNER lattice ((n+1)³): field[c] = R_trilinear(c) − |c − centre|. The
+  // renderer contours it with marching tetrahedra at iso 0, so the drawn
+  // surface IS the physics surface (terrainRadiusAt trilinear) — the visual
+  // slopes and every collision query agree exactly.
+  var field = new Float32Array((n + 1) * (n + 1) * (n + 1));
+  var nnF = n + 1, invDv = 1 / dv;
+  for (kv = 0; kv < n; kv++) {
+    var pzS = (kv + 0.5) * dv - cz;
+    for (jv = 0; jv < n; jv++) {
+      var pyS = (jv + 0.5) * dv - cy;
+      var rowS2 = (kv * n + jv) * n;
+      for (iv = 0; iv < n; iv++) {
+        var pxS = (iv + 0.5) * dv - cx;
+        var rrS = Math.sqrt(pxS * pxS + pyS * pyS + pzS * pzS);
+        idx = rowS2 + iv;
+        solid[idx] = rrS <= R[idx] ? 1 : 0;
+      }
+    }
+  }
+  for (kv = 0; kv <= n; kv++) {
+    var pzF = kv * dv - cz;
+    var fk = kv * dv * invDv - 0.5;
+    var k0 = Math.floor(fk), tz = fk - k0;
+    if (k0 < 0) { k0 = 0; tz = 0; } else if (k0 > n - 2) { k0 = n - 2; tz = 1; }
+    var rowF0 = kv * nnF * nnF;
+    for (jv = 0; jv <= n; jv++) {
+      var pyF = jv * dv - cy;
+      var fj = jv * dv * invDv - 0.5;
+      var j0 = Math.floor(fj), ty = fj - j0;
+      if (j0 < 0) { j0 = 0; ty = 0; } else if (j0 > n - 2) { j0 = n - 2; ty = 1; }
+      var j1 = j0 + 1, k1 = k0 + 1;
+      var rowF = rowF0 + jv * nnF;
+      var rowJ0 = (k0 * n + j0) * n, rowJ1 = (k0 * n + j1) * n;
+      var rowK0 = ((k0 + 1) * n + j0) * n;
+      var rowK1 = ((k0 + 1) * n + j1) * n;
+      for (iv = 0; iv <= n; iv++) {
+        var pxF = iv * dv - cx;
+        var rrF = Math.sqrt(pxF * pxF + pyF * pyF + pzF * pzF);
+        var fi = iv * dv * invDv - 0.5;
+        var i0 = Math.floor(fi), tx = fi - i0;
+        if (i0 < 0) { i0 = 0; tx = 0; } else if (i0 > n - 2) { i0 = n - 2; tx = 1; }
+        var i1 = i0 + 1;
+        // 8 surrounding nodes, trilinear blend of the SMOOTHED radius
+        var rA = R[rowJ0 + i0] * (1 - tx) + R[rowJ0 + i1] * tx;
+        var rB = R[rowJ1 + i0] * (1 - tx) + R[rowJ1 + i1] * tx;
+        var rC2 = R[rowK0 + i0] * (1 - tx) + R[rowK0 + i1] * tx;
+        var rD = R[rowK1 + i0] * (1 - tx) + R[rowK1 + i1] * tx;
+        var rIJ = rA * (1 - ty) + rB * ty;
+        var rKL = rC2 * (1 - ty) + rD * ty;
+        field[rowF0 + jv * nnF + iv] = (rIJ * (1 - tz) + rKL * tz) - rrF;
+      }
+    }
+  }
+
   // land fraction measured on the actual voxels (radial march per direction)
   var LANDN = 4000, land = 0;
   for (ci = 0; ci < LANDN; ci++) {
@@ -348,7 +471,7 @@ FluidSolver.prototype.generateTerrain = function (seed, seaLevel) {
   }
 
   this.terrain = {
-    n: n, dv: dv, solid: solid, R: R,
+    n: n, dv: dv, solid: solid, R: R, field: field,
     Rsl: Rsl, Rlo: Rlo, Rhi: Rhi,
     Rlo2: Rlo * Rlo, Rhi2: Rhi * Rhi,
     landFrac: land / LANDN, seed: seed
@@ -706,8 +829,8 @@ FluidSolver.prototype._sampleVel3 = function (x, y, z, out) {
 
 // ------------------------------------------------------------- rasterize
 // Static world (terrain rock + shell + balls -> SOLID cells, moving-solid
-// velocities). The particle marking pass is a separate chunkable method so
-// the multithreaded pool can scatter it across cores.
+// velocities). The particle marking pass is a separate method so callers can
+// re-mark without re-rasterizing the static world.
 FluidSolver.prototype._rasterize = function () {
   this._rasterizeStatic();
   this._markFluidCells(0, this.nP);
@@ -871,47 +994,10 @@ FluidSolver.prototype._pushBallsChunk = function (p0, p1) {
 };
 
 // ---------------------------------------------------------------------- P2G
-// Serial path: scatter into the shared grids, then normalize by weights.
-// MT path: each worker scatters its particle chunk into its own partial slab
-// (P2G is a data scatter — concurrent writers would race), then face chunks
-// reduce every slab into the shared grids and normalize in one pass.
+// Scatter into the grids, then normalize by weights (one call).
 FluidSolver.prototype._p2g = function () {
   this._p2gInto(0, this.nP, this.u, this.v, this.w, this.uW, this.vW, this.wW);
   this._p2gNormalizeFace(0, this.uN + this.vN + this.wN);
-};
-
-// Sum every worker's partial slab into the shared face grids over the face
-// range [f0, f1) (combined u|v|w face index), normalizing in the same pass.
-FluidSolver.prototype._p2gReduceNorm = function (f0, f1) {
-  var ctx = this._mtCtx;
-  var u = this.u, v = this.v, w = this.w, uW = this.uW, vW = this.vW, wW = this.wW;
-  var uN = this.uN, vN = this.vN, wN = this.wN, F = uN + vN + wN;
-  var nW = ctx.nWorkers, stride = ctx.f32Stride, P = ctx.partialF32;
-  var i, q, base, a, b, su, sw;
-  // u faces [0, uN)
-  a = f0 > 0 ? f0 : 0; b = f1 < uN ? f1 : uN;
-  for (i = a; i < b; i++) {
-    su = 0; sw = 0;
-    for (q = 0; q < nW; q++) { base = stride * q; su += P[base + i]; sw += P[base + F + i]; }
-    u[i] = su; uW[i] = sw;
-    if (sw > 1e-8) u[i] = su / sw;
-  }
-  // v faces [uN, uN+vN)
-  a = f0 > uN ? f0 : uN; b = f1 < uN + vN ? f1 : uN + vN;
-  for (i = a; i < b; i++) {
-    su = 0; sw = 0;
-    for (q = 0; q < nW; q++) { base = stride * q; su += P[base + i]; sw += P[base + F + i]; }
-    v[i - uN] = su; vW[i - uN] = sw;
-    if (sw > 1e-8) v[i - uN] = su / sw;
-  }
-  // w faces [uN+vN, F)
-  a = f0 > uN + vN ? f0 : uN + vN; b = f1 < F ? f1 : F;
-  for (i = a; i < b; i++) {
-    su = 0; sw = 0;
-    for (q = 0; q < nW; q++) { base = stride * q; su += P[base + i]; sw += P[base + F + i]; }
-    w[i - uN - vN] = su; wW[i - uN - vN] = sw;
-    if (sw > 1e-8) w[i - uN - vN] = su / sw;
-  }
 };
 
 FluidSolver.prototype._p2gInto = function (p0, p1, u, v, w, uW, vW, wW) {
@@ -1209,7 +1295,7 @@ FluidSolver.prototype._pressureSolve = function () {
       fluidList[nF++] = c;
     }
   }
-  if (nF === 0) { this.cellPhi.set(q); return; }   // copy: MT workers hold the cellPhi view
+  if (nF === 0) { this.cellPhi.set(q); return; }   // copy: leave q intact
   this.nFluid = nF;
 
   // pass 2: assemble rows
@@ -1286,7 +1372,7 @@ FluidSolver.prototype._pressureSolve = function () {
   }
 
   // project() reads cellPhi; q is cell-indexed with q = 0 at non-fluid cells.
-  // COPY (not rebind): cellPhi lives in the shared MT layout — workers hold
+  // COPY (not rebind): q is scratch the caller may keep referencing
   // their own view of it and a rebind would leave them reading stale zeros.
   this.cellPhi.set(q);
 };
@@ -1646,13 +1732,13 @@ FluidSolver.prototype._advect = function (dt) {
 };
 
 // Chunkable advection: per-particle physics only (grid reads are read-only;
-// RNG streams are re-seeded per chunk by the MT runner). Balls are pushed out
+// RNG streams are re-seeded per chunk). Balls are pushed out
 // by the caller afterwards (see _pushBallsChunk).
 FluidSolver.prototype._advectChunk = function (p0, p1, dt) {
   var px = this.px, py = this.py, pz = this.pz, pvx = this.pvx, pvy = this.pvy, pvz = this.pvz;
   var nP = this.nP, dx = this.dx, g = this.gravity;
   var nx = this.nx, ny = this.ny, nz = this.nz, type = this.cellType, fl = this.pflag;
-  var pcool = this.pcool;
+  var pcool = this.pcool, pAir = this.pAir;
   var W = this.W, H = this.H, D = this.D;
   var xLo = dx * 1.02, xHi = W - dx * 1.02;
   var yLo = dx * 1.02, yHi = H - dx * 1.02;
@@ -1671,12 +1757,82 @@ FluidSolver.prototype._advectChunk = function (p0, p1, dt) {
     windSX /= windLen; windSY /= windLen; windSZ /= windLen;
   }
 
+  var rainTe = Math.min(this.rainT, this.cloudT - 0.02); if (rainTe < 0) rainTe = 0;
   for (var p = p0; p < p1; p++) {
     var x = px[p], y = py[p], z = pz[p];
     var vx = pvx[p], vy = pvy[p], vz = pvz[p];
 
-    if (fl[p] === 1) {
-      // ballistic droplet (spray): gravity + air drag, capped at terminal speed
+    if (fl[p] === 5) {
+      // ice: STUCK grains (sea ice, snow pack — pAir 1) hold position and
+      // never move again; FREE grains (freezing rain, pAir 0) flutter down
+      // under gravity with strong drag until they touch terrain (→ stick),
+      // the liquid (→ melt and merge) or another grain (see _iceContacts)
+      if (pAir[p] === 1 || !this.terrain && this.mode === 'sphere') {
+        pvx[p] = 0; pvy[p] = 0; pvz[p] = 0;
+        continue;
+      }
+      var dragK = 12;                      // snow terminal ≈ 0.6·g/dragK
+      var gI = this.gravity || 9.81;
+      var axI = 0, ayI = -gI * 0.6, azI = 0;
+      if (this.mode !== 'sphere') ayI = -gI * 0.6;
+      else {
+        var exI = x - this.cx, eyI = y - this.cy, ezI = z - this.cz;
+        var elI = Math.sqrt(exI * exI + eyI * eyI + ezI * ezI) || 1e-9;
+        axI = -gI * 0.6 * exI / elI; ayI = -gI * 0.6 * eyI / elI; azI = -gI * 0.6 * ezI / elI;
+      }
+      pvx[p] += (axI - dragK * pvx[p]) * dt;
+      pvy[p] += (ayI - dragK * pvy[p]) * dt;
+      pvz[p] += (azI - dragK * pvz[p]) * dt;
+      x += pvx[p] * dt; y += pvy[p] * dt; z += pvz[p] * dt;
+      var rrI;
+      if (this.mode === 'sphere') {
+        rrI = Math.sqrt((x - this.cx) * (x - this.cx) + (y - this.cy) * (y - this.cy) + (z - this.cz) * (z - this.cz));
+        if (rrI > this.oceanR + this.atmosphereH) {
+          var scI = (this.oceanR + this.atmosphereH) / rrI;
+          x = this.cx + (x - this.cx) * scI; y = this.cy + (y - this.cy) * scI; z = this.cz + (z - this.cz) * scI;
+          pvx[p] *= 0.5; pvy[p] *= 0.5; pvz[p] *= 0.5;
+        }
+        if (this._rockCellAt(x, y, z)) {
+          // terrain contact: freeze to the spot for good
+          pAir[p] = 1; pvx[p] = pvy[p] = pvz[p] = 0;
+          px[p] = x; py[p] = y; pz[p] = z;
+          continue;
+        }
+        var ciI = Math.floor(x / dx), cjI = Math.floor(y / dx), ckI = Math.floor(z / dx);
+        if (ciI >= 0 && cjI >= 0 && ckI >= 0 && ciI < nx && cjI < ny && ckI < nz &&
+            type[(ckI * ny + cjI) * nx + ciI] === FLUID) {
+          // ice is buoyant: it CANNOT sink into the liquid. Raft it to the
+          // water surface along the radial (march outward until the cell is
+          // no longer fluid), park it there as a floating raft (stuck — it
+          // still melts back per the melt point), and never let it descend.
+          var miI = ciI, mjI = cjI, mkI = ckI;
+          var exF = x - this.cx, eyF = y - this.cy, ezF = z - this.cz;
+          var elF = Math.sqrt(exF * exF + eyF * eyF + ezF * ezF) || 1e-9;
+          var stepF = dx * 0.5, surfR = 0;
+          for (var mf = 0; mf < 12; mf++) {
+            var qxI = x + exF / elF * stepF, qyI = y + eyF / elF * stepF, qzI = z + ezF / elF * stepF;
+            var qiI = Math.floor(qxI / dx), qjI = Math.floor(qyI / dx), qkI = Math.floor(qzI / dx);
+            if (qiI < 0 || qjI < 0 || qkI < 0 || qiI >= nx || qjI >= ny || qkI >= nz) break;
+            if (type[(qkI * ny + qjI) * nx + qiI] !== FLUID) { surfR = 1; break; }
+            x = qxI; y = qyI; z = qzI;
+            miI = qiI; mjI = qjI; mkI = qkI;
+          }
+          miI = miI;   // (cell indices kept for clarity — position is what matters)
+          pAir[p] = 1; pvx[p] = pvy[p] = pvz[p] = 0;   // float: stuck at the surface
+          if (this.pWx && this.pWx.length > p) { this.pWx[p] = 0; this.pWy[p] = 0; this.pWz[p] = 0; }
+        }
+      } else {
+        if (y > this.yHi) { y = this.yHi; pvy[p] = -Math.abs(pvy[p]) * 0.2; }
+        if (y <= this.yLo + 0.001) {   // floor: sticks
+          y = this.yLo + 0.001; pAir[p] = 1; pvx[p] = pvy[p] = pvz[p] = 0;
+        }
+      }
+      px[p] = x; py[p] = y; pz[p] = z;
+      continue;
+    }
+    if (fl[p] === 1 || fl[p] === 4) {
+      // ballistic droplet (spray + rain): gravity + air drag, capped at
+      // terminal speed
       if (sphere) {
         // same inverse-square planet law as the grid: a = -g·(R2/r)²·r̂
         var gx = x - cx, gy = y - cy, gz = z - cz;
@@ -1764,8 +1920,9 @@ FluidSolver.prototype._advectChunk = function (p0, p1, dt) {
       continue;
     }
 
-    if (fl[p] === 2) {
-      // Atmospheric parcels: coherent circulating winds and buoyant lift,
+    if (fl[p] === 2 || fl[p] === 3) {
+      // Atmospheric parcels (steam + cloud droplets): coherent circulating
+      // winds and buoyant lift,
       // terrain/ceiling contact, vapor collisions and thermal condensation.
       var Tv = this.pT[p];
       this.pAir[p] += dt;
@@ -1945,12 +2102,14 @@ FluidSolver.prototype._advectChunk = function (p0, p1, dt) {
         pvx[p] = 0; pvy[p] = 0; pvz[p] = 0;
         this.pAir[p] = 0;
         fl[p] = 0;
-      } else if (Tv < 0.2 || this.pAir[p] > 40) {
-        // cold (or stale) vapor condenses mid-air: sheds its speed and
-        // free-falls; gravity and the spray rules take over
+      } else if (fl[p] === 2 && (Tv < rainTe || this.pAir[p] > 40)) {
+        // cold (or stale) steam rains out mid-air: sheds its speed and
+        // free-falls; gravity and the spray rules take over. Cloud droplets
+        // are exempt — only steam produces rain (the phase pass owns the
+        // transitions), so clouds persist until warmed or absorbed.
         pvx[p] = 0; pvy[p] = 0; pvz[p] = 0;
         this.pAir[p] = 0;
-        fl[p] = 1;
+        fl[p] = 4;
       }
       continue;
     }
@@ -2329,35 +2488,16 @@ FluidSolver.prototype._updateBalls = function (dt) {
 };
 
 // -------------------------------------------------------------------- substep
-// One operator-split substep. When the multithreaded pool is active, chunked
-// stages dispatch to the worker pool (the coordinator runs chunk 0 inline) and
-// grid-stage slices parallelize too when this._mtGrid is set; every dispatch
-// is a hard barrier, so stage order is identical to the serial path.
+// One operator-split substep (serial CPU path — the physics reference).
 FluidSolver.prototype._substep = function (dt) {
-  var mt = this._mt, mtGrid = mt && this._mtGrid;
   this.u.fill(0); this.v.fill(0); this.w.fill(0);
   this.uW.fill(0); this.vW.fill(0); this.wW.fill(0);
 
   this._rasterizeStatic();
-  if (mt) {
-    this._mtCounters(0, 0);
-    // MARK, PUSH_BALLS and P2G are all per-particle chunk stages with no
-    // cross-particle reads — one dispatch instead of three.
-    if (this.balls.length <= MTTASKS.MAX_BALLS) {
-      this._mtRun([MTTASKS.TASK.MARK, MTTASKS.TASK.PUSH_BALLS, MTTASKS.TASK.P2G], this.nP);
-    } else {
-      this._mtRun([MTTASKS.TASK.MARK, MTTASKS.TASK.P2G], this.nP);
-      this._pushOutOfBalls();     // too many balls for the mailbox: serial
-    }
-    this.airborneCount = 0;       // re-accumulated by G2P chunks below
-    this._mtRun([MTTASKS.TASK.P2G_REDUCE], this.uN + this.vN + this.wN);
-  } else {
-    this._markFluidCells(0, this.nP);
-    this._pushOutOfBalls();
-    this._p2g();
-  }
-  if (mtGrid) this._mtRun([MTTASKS.TASK.BC], this.nz, 'kslab');
-  else this._applyBC();
+  this._markFluidCells(0, this.nP);
+  this._pushOutOfBalls();
+  this._p2g();
+  this._applyBC();
 
   // snapshot pre-projection velocities for the FLIP update
   this.uO.set(this.u); this.vO.set(this.v); this.wO.set(this.w);
@@ -2378,10 +2518,8 @@ FluidSolver.prototype._substep = function (dt) {
     // emerge at the stairstep terrain — the projection cannot remove
     // gravity's tangential part there — so water runs downhill and pools to
     // a level sea.
-    // grid-MT: BC rides in the same k-slab job as GRAVITY (serial order per
-    // slab, no cross-slab reads) — one dispatch instead of two.
-    this._applyPlanetGravityMT(dt, mtGrid);
-    if (!mtGrid) this._applyBC();
+    this._applyPlanetGravity(dt);
+    this._applyBC();
   }
   // re-zero boundary planes
   var nx = this.nx, ny = this.ny, nz = this.nz;
@@ -2393,28 +2531,17 @@ FluidSolver.prototype._substep = function (dt) {
   }
 
   this._pressureSolve();
-  if (mtGrid) this._mtRun([MTTASKS.TASK.PROJECT], this.nz, 'kslab');
-  else this._project();
+  this._project();
   // ocean dynamics: swirl keeper on the projected field — the FLIP delta then
   // hands the re-injected eddies to the particles (see _vorticityConfinement)
   if (this.vorticity > 0) this._vorticityConfinement(dt);
   // grid velocity ceiling: the free-surface projection can concentrate
   // momentum into a few faces; uncapped it re-launches splash-back forever
   // (the "redirect ratchet"). Legit flow stays under maxSpeed anyway.
-  if (mtGrid) {
-    this._mtRun([MTTASKS.TASK.CLAMP_UMAX], this.uN + this.vN + this.wN);
-    this.umax = this._mt.umaxReduce();
-  } else {
-    this.umax = this._clampUmSlice(0, this.uN + this.vN + this.wN);
-  }
+  this.umax = this._clampUmSlice(0, this.uN + this.vN + this.wN);
   this._extrapolate();
-  if (mt) {
-    this._mtRun([MTTASKS.TASK.G2P, MTTASKS.TASK.ADVECT], this.nP, 'linear', dt);
-    this.airborneCount = this._mt.counters[0];
-  } else {
-    this._g2p(dt);
-    this._advect(dt);
-  }
+  this._g2p(dt);
+  this._advect(dt);
   this._gridSampleValid = false;
   this._updateBalls(dt);
   this.dtLast = dt;
@@ -2449,41 +2576,30 @@ FluidSolver.prototype._clampUmSlice = function (f0, f1) {
   return um;
 };
 
-// planet gravity: serial wrapper owns the ramp; MT slices take the scale.
-FluidSolver.prototype._applyPlanetGravityMT = function (dt, mtGrid) {
+// planet gravity: serial wrapper owns the startup ramp.
+FluidSolver.prototype._applyPlanetGravity = function (dt) {
   var gs = this._gRamp / 1.5; if (gs > 1) gs = 1;
   this._gRamp += dt;
   if (gs <= 0) return;
   gs *= this.gravity;
-  if (mtGrid) {
-    this._mtGs = gs;
-    this._mtRun([MTTASKS.TASK.GRAVITY, MTTASKS.TASK.BC], this.nz, 'kslab', dt);
-  } else {
-    this._applyPlanetGravitySlice(0, this.nz, dt, gs);
-  }
+  this._applyPlanetGravitySlice(0, this.nz, dt, gs);
 };
-
 FluidSolver.prototype.step = function (dtFrame) {
-  // Lazy (re-)enable: fills finalize particle capacity, so the pool starts on
-  // the first step after a reset. Failures fall back to the serial path once.
-  if (!this._mt && this._mtWanted && !this._mtFailed) {
-    try { this.enableMultithreading(this._mtWanted); }
-    catch (e) { this._mtFailed = String((e && e.message) || e); }
-  }
-  if (this._mt && this._mt.async) return this._stepAsync(dtFrame);
-  return this._stepSync(dtFrame);
+  this._stepSync(dtFrame);
 };
 
-// Synchronous step: used headless (Node tests, benchmarks) and in the browser
-// whenever no pool is active. With the Node mailbox pool the MT dispatches
-// below block on Atomics.wait, so this stays fully synchronous.
+// Synchronous step (the physics reference): thermal + currents run at ~25 Hz,
+// the CFL-limited substeps integrate the fluid, then the inter-particle and
+// phase passes run once per frame.
 FluidSolver.prototype._stepSync = function (dtFrame) {
   this._simTime += dtFrame;
   if (this.mode === 'sphere' && this.pT.length > 1) {
     this._heatAcc = (this._heatAcc || 0) + dtFrame;
     if (this._heatAcc >= 1 / 25) {           // thermal + currents run at ~25 Hz
       var dtTick = Math.min(this._heatAcc, 1 / 12);
-      this._updateHeatTick(dtTick);
+      this._updateHeat(dtTick);
+      if (this.sunActivity > 0) this._updateEvaporation(dtTick);
+      if (this.currents > 0) this._updateCurrents(dtTick);
       this._heatAcc = 0;
     }
   }
@@ -2502,407 +2618,9 @@ FluidSolver.prototype._stepSync = function (dtFrame) {
   }
   this.substepsLast = nSub;
   this._vaporCollisions();
+  this._updatePhaseChanges(dtFrame);
+  this._iceContacts();
   this._pushSurfaceParticles();
-};
-
-// Asynchronous step (browser pool): identical stage order, awaits between
-// dispatches. Returns a promise resolving when the step is fully applied.
-FluidSolver.prototype._stepAsync = async function (dtFrame) {
-  this._simTime += dtFrame;
-  if (this.mode === 'sphere' && this.pT.length > 1) {
-    this._heatAcc = (this._heatAcc || 0) + dtFrame;
-    if (this._heatAcc >= 1 / 25) {
-      var dtTick = Math.min(this._heatAcc, 1 / 12);
-      await this._updateHeatTickAsync(dtTick);
-      this._heatAcc = 0;
-    }
-  }
-  var remaining = dtFrame, guard = 0, nSub = 0;
-  var base = dtFrame / Math.max(1, this.substeps);
-  while (remaining > 1e-6 && guard < 10) {
-    var dt = Math.min(base, (this.cfl * this.dx) / Math.max(this.umax, 0.08), 1 / 100);
-    if (dt < 1e-5) dt = 1e-5;
-    await this._substepAsync(dt);
-    remaining -= dt;
-    guard++; nSub++;
-  }
-  this.substepsLast = nSub;
-  this._vaporCollisions();
-  await this._mtRunAsync([MTTASKS.TASK.PUSH_SURFACE], this.nP);
-};
-
-// ---- thermal tick (~25 Hz) ----------------------------------------------------
-FluidSolver.prototype._updateHeatTick = function (dt) {
-  var mt = this._mt;
-  if (mt) {
-    this._mtSyncTerrainIfNeeded();
-    this._mtCounters(1, 0);
-    this._mt.zeroI32Slabs();   // partial bin counts accumulate — clear first
-    this._mtRun([MTTASKS.TASK.HEAT_BIN_COUNT], this.nP, 'linear', dt);
-    this._heatBinScanMT();
-    this._mtRun([MTTASKS.TASK.HEAT_BIN_FILL], this.nP, 'linear', dt);
-    this._mtRun([MTTASKS.TASK.HEAT_SHADOW], this.nP, 'linear', dt);
-    if (this.heatK > 0) {
-      this._heatDt = dt;
-      this._heatAlpha = Math.min(this.heatK * dt * 0.15, 0.14);
-      this._mtRun([MTTASKS.TASK.HEAT_MEANS], this.nCells);
-      this._heatConductFlux();
-      this._mtRun([MTTASKS.TASK.HEAT_APPLY], this.nCells);
-    }
-    this._mtRun([MTTASKS.TASK.HEAT_CONVECT], this.nP, 'linear', dt);
-  } else {
-    this._updateHeat(dt);
-  }
-  if (this.sunActivity > 0) this._updateEvaporationTick(dt);
-  if (this.currents > 0) this._updateCurrentsTick(dt);
-};
-
-FluidSolver.prototype._updateHeatTickAsync = async function (dt) {
-  var mt = this._mt;
-  if (mt) {
-    this._mtSyncTerrainIfNeeded();
-    this._mtCounters(1, 0);
-    await this._mtRunAsync([MTTASKS.TASK.HEAT_BIN_COUNT], this.nP, 'linear', dt);
-    this._heatBinScanMT();
-    await this._mtRunAsync([MTTASKS.TASK.HEAT_BIN_FILL], this.nP, 'linear', dt);
-    await this._mtRunAsync([MTTASKS.TASK.HEAT_SHADOW], this.nP, 'linear', dt);
-    if (this.heatK > 0) {
-      this._heatDt = dt;
-      this._heatAlpha = Math.min(this.heatK * dt * 0.15, 0.14);
-      await this._mtRunAsync([MTTASKS.TASK.HEAT_MEANS], this.nCells);
-      this._heatConductFlux();
-      await this._mtRunAsync([MTTASKS.TASK.HEAT_APPLY], this.nCells);
-    }
-    await this._mtRunAsync([MTTASKS.TASK.HEAT_CONVECT], this.nP, 'linear', dt);
-  } else {
-    this._updateHeat(dt);
-  }
-  if (this.sunActivity > 0) await this._updateEvaporationTickAsync(dt);
-  if (this.currents > 0) await this._updateCurrentsTickAsync(dt);
-};
-
-FluidSolver.prototype._updateEvaporationTick = function (dt) {
-  if (this._mt) {
-    this._mtRun([MTTASKS.TASK.EVAP_RANGE], this.nP, 'linear', dt);
-    var r = this._mt.evapRangeReduce();
-    if (isFinite(r[0]) && isFinite(r[1])) {
-      this._mtCounters(1, 0);
-      this._mtRun([MTTASKS.TASK.EVAP], this.nP, 'linear', dt, { tmin: r[0], tmax: r[1] });
-      this.evapCount = this._mt.counters[1];
-    }
-  } else {
-    this._updateEvaporation(dt);
-  }
-};
-
-FluidSolver.prototype._updateEvaporationTickAsync = async function (dt) {
-  if (this._mt) {
-    await this._mtRunAsync([MTTASKS.TASK.EVAP_RANGE], this.nP, 'linear', dt);
-    var r = this._mt.evapRangeReduce();
-    if (isFinite(r[0]) && isFinite(r[1])) {
-      this._mtCounters(1, 0);
-      await this._mtRunAsync([MTTASKS.TASK.EVAP], this.nP, 'linear', dt, { tmin: r[0], tmax: r[1] });
-      this.evapCount = this._mt.counters[1];
-    }
-  } else {
-    this._updateEvaporation(dt);
-  }
-};
-
-FluidSolver.prototype._updateCurrentsTick = function (dt) {
-  if (this._mt) {
-    this._ensureCurrentsBuffers();
-    this._buildCurrentField();
-    this._mtRun([MTTASKS.TASK.CURR_APPLY], this.nP, 'linear', dt);
-  } else {
-    this._updateCurrents(dt);
-  }
-};
-
-FluidSolver.prototype._updateCurrentsTickAsync = async function (dt) {
-  if (this._mt) {
-    this._ensureCurrentsBuffers();
-    this._buildCurrentField();
-    await this._mtRunAsync([MTTASKS.TASK.CURR_APPLY], this.nP, 'linear', dt);
-  } else {
-    this._updateCurrents(dt);
-  }
-};
-
-// Asynchronous substep — mirrors _substep stage for stage.
-FluidSolver.prototype._substepAsync = async function (dt) {
-  var mt = this._mt, mtGrid = mt && this._mtGrid;
-  this.u.fill(0); this.v.fill(0); this.w.fill(0);
-  this.uW.fill(0); this.vW.fill(0); this.wW.fill(0);
-
-  this._rasterizeStatic();
-  this._mtCounters(0, 0);
-  // MARK, PUSH_BALLS and P2G are per-particle chunk stages — one dispatch
-  if (this.balls.length <= MTTASKS.MAX_BALLS) {
-    await this._mtRunAsync([MTTASKS.TASK.MARK, MTTASKS.TASK.PUSH_BALLS, MTTASKS.TASK.P2G], this.nP);
-  } else {
-    await this._mtRunAsync([MTTASKS.TASK.MARK, MTTASKS.TASK.P2G], this.nP);
-    this._pushOutOfBalls();
-  }
-  this.airborneCount = 0;
-  await this._mtRunAsync([MTTASKS.TASK.P2G_REDUCE], this.uN + this.vN + this.wN);
-  if (mtGrid) await this._mtRunAsync([MTTASKS.TASK.BC], this.nz, 'kslab');
-  else this._applyBC();
-
-  this.uO.set(this.u); this.vO.set(this.v); this.wO.set(this.w);
-  this._viscosity(dt);
-
-  if (this.mode !== 'sphere') {
-    for (var i = 0, N = this.v.length; i < N; i++) this.v[i] -= this.gravity * dt;
-    this._applyBC();
-  } else {
-    // grid-MT: BC rides in the same k-slab job as GRAVITY (serial order per
-    // slab, no cross-slab reads) — one dispatch instead of two.
-    this._applyPlanetGravityAsync(dt, mtGrid);
-    if (!mtGrid) this._applyBC();
-  }
-  var nx = this.nx, ny = this.ny, nz = this.nz;
-  if (this.mode !== 'sphere') {
-    for (var k = 0; k < nz; k++) for (var i2 = 0; i2 < nx; i2++) {
-      this.v[(k * (ny + 1)) * nx + i2] = 0;
-      this.v[(k * (ny + 1) + ny) * nx + i2] = 0;
-    }
-  }
-
-  this._pressureSolve();
-  if (mtGrid) await this._mtRunAsync([MTTASKS.TASK.PROJECT], this.nz, 'kslab');
-  else this._project();
-  if (this.vorticity > 0) this._vorticityConfinement(dt);
-  if (mtGrid) {
-    await this._mtRunAsync([MTTASKS.TASK.CLAMP_UMAX], this.uN + this.vN + this.wN);
-    this.umax = this._mt.umaxReduce();
-  } else {
-    this.umax = this._clampUmSlice(0, this.uN + this.vN + this.wN);
-  }
-  this._extrapolate();
-  await this._mtRunAsync([MTTASKS.TASK.G2P, MTTASKS.TASK.ADVECT], this.nP, 'linear', dt);
-  this.airborneCount = this._mt.counters[0];
-  this._gridSampleValid = false;
-  this._updateBalls(dt);
-  this.dtLast = dt;
-};
-
-FluidSolver.prototype._applyPlanetGravityAsync = async function (dt, mtGrid) {
-  var gs = this._gRamp / 1.5; if (gs > 1) gs = 1;
-  this._gRamp += dt;
-  if (gs <= 0) return;
-  gs *= this.gravity;
-  if (mtGrid) {
-    this._mtGs = gs;
-    await this._mtRunAsync([MTTASKS.TASK.GRAVITY, MTTASKS.TASK.BC], this.nz, 'kslab', dt);
-  } else {
-    this._applyPlanetGravitySlice(0, this.nz, dt, gs);
-  }
-};
-
-// ---- multithreaded plumbing ---------------------------------------------------
-FluidSolver.prototype._mtRun = function (codes, nItems, mode, dt, extras) {
-  this._mt.run(codes, nItems, mode, dt || 0, this._mtGs, extras);
-};
-FluidSolver.prototype._mtRunAsync = function (codes, nItems, mode, dt, extras) {
-  return this._mt.runAsync(codes, nItems, mode, dt || 0, this._mtGs, extras);
-};
-FluidSolver.prototype._mtCounters = function (idx, value) {
-  this._mt.counters[idx] = value;
-};
-FluidSolver.prototype._mtSyncTerrainIfNeeded = function () {
-  if (!this._mtTerrain) return;
-  if (this.terrain && this.terrain !== this._mtTerrainSrc) {
-    MTPOOL.syncTerrainSlab(this._mtTerrain, this.terrain);
-    this._mtTerrainSrc = this.terrain;
-  }
-};
-
-// Force every lazily-created SHARED buffer into existence so the layout below
-// is complete and stable for the workers.
-FluidSolver.prototype._ensureMTBuffers = function () {
-  var cap = this.capacity, nCells = this.nCells;
-  if (!this.pLight || this.pLight.length < cap) this.pLight = this._alloc('pLight', Float32Array, cap);
-  if (!this._advU || this._advU.length < cap) {
-    this._advU = this._alloc('_advU', Float64Array, cap);
-    this._advV = this._alloc('_advV', Float64Array, cap);
-    this._advW = this._alloc('_advW', Float64Array, cap);
-  }
-  if (this._hCnt.length !== nCells) {
-    this._hCnt = this._alloc('_hCnt', Int32Array, nCells);
-    this._hStart = this._alloc('_hStart', Int32Array, nCells + 1);
-    this._hCur = this._alloc('_hCur', Int32Array, nCells);
-  }
-  if (this._hOrd.length < cap) this._hOrd = this._alloc('_hOrd', Int32Array, cap * 2);
-  if (!this._heatMean || this._heatMean.length !== nCells) {
-    this._heatMean = this._alloc('_heatMean', Float64Array, nCells);
-    this._heatDelta = this._alloc('_heatDelta', Float64Array, nCells);
-  }
-  this._ensureCurrentsBuffers();
-  if (!this._gu || this._gu.length !== this.uN) this._buildPlanetGravity();
-};
-
-// Shared-field layout: [name, ctor, length]. Byte offsets are 8-byte aligned
-// so Float64 views stay aligned on every platform.
-FluidSolver.prototype._mtFieldSpec = function () {
-  var cap = this.capacity, nCells = this.nCells;
-  var stride = 4;
-  var gn = (((this.nx / stride) | 0) + 2) * (((this.ny / stride) | 0) + 2) * (((this.nz / stride) | 0) + 2);
-  return [
-    // Float64 first (alignment)
-    ['_advU', Float64Array, cap], ['_advV', Float64Array, cap], ['_advW', Float64Array, cap],
-    ['_heatMean', Float64Array, nCells], ['_heatDelta', Float64Array, nCells],
-    // Float32
-    ['cellPhi', Float32Array, nCells], ['q', Float32Array, nCells],
-    ['u', Float32Array, this.uN], ['v', Float32Array, this.vN], ['w', Float32Array, this.wN],
-    ['_gu', Float32Array, this.uN], ['_gv', Float32Array, this.vN], ['_gw', Float32Array, this.wN],
-    ['uW', Float32Array, this.uN], ['vW', Float32Array, this.vN], ['wW', Float32Array, this.wN],
-    ['uO', Float32Array, this.uN], ['vO', Float32Array, this.vN], ['wO', Float32Array, this.wN],
-    ['dens', Float32Array, (this.nx + 1) * (this.ny + 1) * (this.nz + 1)],
-    ['px', Float32Array, cap], ['py', Float32Array, cap], ['pz', Float32Array, cap],
-    ['pvx', Float32Array, cap], ['pvy', Float32Array, cap], ['pvz', Float32Array, cap],
-    ['pT', Float32Array, cap], ['pAir', Float32Array, cap], ['pLight', Float32Array, cap],
-    ['_cfx', Float32Array, gn], ['_cfy', Float32Array, gn], ['_cfz', Float32Array, gn],
-    // Uint8
-    ['cellType', Uint8Array, nCells],
-    ['pflag', Uint8Array, cap], ['pcool', Uint8Array, cap],
-    ['_staticTypes', Uint8Array, nCells],
-    // Int32
-    ['_hCnt', Int32Array, nCells], ['_hStart', Int32Array, nCells + 1],
-    ['_hCur', Int32Array, nCells], ['_hOrd', Int32Array, cap * 2],
-    ['svx', Float32Array, nCells], ['svy', Float32Array, nCells], ['svz', Float32Array, nCells]
-  ];
-};
-
-FluidSolver.prototype.enableMultithreading = function (threads) {
-  if (this._mt) return this._mt;
-  if (!MTPOOL || !MTPOOL.supported()) throw new Error('SharedArrayBuffer + workers unavailable (multithreading disabled)');
-  if (!(this.capacity > 0)) throw new Error('enableMultithreading before fill: no particle capacity');
-  if (!MTTASKS) throw new Error('mt task registry missing');
-  threads = threads | 0;
-  if (!threads) threads = Math.max(1, MTPOOL.coreCount() - 1);
-  if (threads < 1) threads = 1;
-
-  this._ensureMTBuffers();
-  this._rasterizeStatic();          // populate the static-type cache for workers
-
-  // ---- build the shared state buffer and rebind fields -----------------------
-  var spec = this._mtFieldSpec().filter(function (f) { return f[2] > 0; });
-  var CTORCODE = [Float32Array, Float64Array, Uint8Array, Int32Array];
-  var CODEBYTES = [4, 8, 1, 4];
-  var layout = [], byName = {}, off = 0, i, f;
-  for (i = 0; i < spec.length; i++) {
-    f = spec[i];
-    var code = CTORCODE.indexOf(f[1]);
-    if (code < 0) throw new Error('MT: unsupported field type ' + f[1]);
-    off = (off + CODEBYTES[code] - 1) & ~(CODEBYTES[code] - 1);
-    var entry = { name: f[0], c: code, len: f[2], off: off, ctor: f[1] };
-    if (byName[f[0]]) throw new Error('MT: duplicate layout name ' + f[0]);
-    byName[f[0]] = entry;
-    layout.push(entry);
-    off += f[2] * CODEBYTES[code];
-  }
-  off = (off + 15) & ~15;
-  var state = new SharedArrayBuffer(off);
-  var oldAlloc = this._alloc;
-  for (i = 0; i < layout.length; i++) {
-    var e = layout[i];
-    var view = new e.ctor(state, e.off, e.len);
-    var cur = this[e.name];
-    if (cur && cur.length) view.set(cur.length >= e.len ? cur.subarray(0, e.len) : cur);
-    this[e.name] = view;
-  }
-  // keep a main-side ctor record (functions cannot cross structured clone)
-  this._mtLayoutCtors = layout.map(function (e2) { return e2.ctor; });
-  for (i = 0; i < layout.length; i++) delete layout[i].ctor;
-  this._mtLayout = layout;
-  // late allocations (pLight re-alloc, cache rebuilds) resolve to the views
-  this._alloc = function (name, ctor, len) {
-    if (byName[name]) {
-      var v = byName[name];
-      if (v.c !== CTORCODE.indexOf(ctor)) throw new Error('MT layout type mismatch: ' + name);
-      return new ctor(state, v.off, v.len);
-    }
-    return oldAlloc(name, ctor, len);
-  };
-
-  // ---- terrain slab -----------------------------------------------------------
-  var terrainSlab = null;
-  if (this.mode === 'sphere' && this.terrain && this.terrain.R) {
-    terrainSlab = MTPOOL.makeTerrainSlab(this.terrain);
-    terrainSlab.scalarsI[0] = 1;
-    this._mtTerrainSrc = this.terrain;
-  }
-
-  // ---- worker construction options ---------------------------------------------
-  var opts = {
-    nx: this.nx, ny: this.ny, nz: this.nz, dx: this.dx,
-    mode: this.mode, coreR: this.coreR,
-    bumpiness: this.bumpiness, terrainSeed: this.terrainSeed,
-    viscosity: this.viscosity, gravity: this.gravity, pic: this.pic,
-    maxSpeed: this.maxSpeed, targetParticles: this.targetParticles,
-    sunActivity: this.sunActivity, atmosphereH: this.atmosphereH,
-    ceilReflect: this.ceilReflect, vorticity: this.vorticity, currents: this.currents
-  };
-
-  var solverPath = null;
-  if (typeof module !== 'undefined' && module.exports && typeof module.filename === 'string') {
-    solverPath = module.filename;
-  }
-  this._mtGrid = typeof this._mtGrid === 'boolean' ? this._mtGrid : (MTPOOL.impl() === 'node');
-  var pool = MTPOOL.create(this, {
-    threads: threads, opts: opts, layout: layout, state: state,
-    terrain: terrainSlab, solverPath: solverPath
-  });
-  this._mt = pool;
-  this._mtCtx = pool.mainCtx;
-  this._mtTerrain = terrainSlab;
-  this._mtTerrainRev = 1;
-  this._mtSeed = (this._mtSeed || 0x51ab3c77) >>> 0;
-  this._mtGs = 1;
-  this._mtWanted = threads;
-  this._mtFailed = null;
-  return pool;
-};
-
-FluidSolver.prototype.disableMultithreading = function () {
-  if (this._mt) {
-    try { this._mt.destroy(); } catch (e) {}
-    this._mt = null;
-    this._mtCtx = null;
-    // rebind shared fields to private arrays, preserving current contents
-    var layout = this._mtLayout || [];
-    var ctors = this._mtLayoutCtors || [];
-    for (var i = 0; i < layout.length; i++) {
-      var e = layout[i];
-      var view = this[e.name];
-      var fresh = new ctors[i](e.len);
-      if (view && view.length >= e.len) fresh.set(view.subarray(0, e.len));
-      else if (view && view.length) fresh.set(view);
-      this[e.name] = fresh;
-    }
-    this._mtLayout = null;
-    this._mtLayoutCtors = null;
-    this._mtTerrain = null;
-    this._mtTerrainSrc = null;
-    this._alloc = function (name, ctor, len) { return new ctor(len); };
-  }
-  this._mtGrid = undefined;
-  // An explicit disable wins over the lazy re-enable in step(): the UI
-  // toggle must actually switch the solver back to the serial path.
-  // (Before this, disableMultithreading kept _mtWanted, so the very next
-  // step() silently re-spawned the pool and the checkbox did nothing.)
-  this._mtWanted = 0;
-};
-
-FluidSolver.prototype.mtStatus = function () {
-  return {
-    active: !!this._mt,
-    threads: this._mt ? this._mt.threads : 0,
-    kind: this._mt ? this._mt.kind : (this._mtFailed ? 'unavailable' : null),
-    gridSlices: this._mt ? !!this._mtGrid : false,
-    failed: this._mtFailed || null
-  };
 };
 
 // ------------------------------------------------------------- heat & sunlight
@@ -2945,7 +2663,7 @@ FluidSolver.prototype._heatBinScanSerial = function () {
     hStart = this._hStart = this._alloc('_hStart', Int32Array, nCells + 1);
     hCur = this._hCur = this._alloc('_hCur', Int32Array, nCells);
   }
-  if (hOrd.length < nP) hOrd = this._hOrd = this._alloc('_hOrd', Int32Array, this._mt ? this.capacity * 2 : nP * 2);
+  if (hOrd.length < nP) hOrd = this._hOrd = this._alloc('_hOrd', Int32Array, nP * 2);
   hCnt.fill(0);
   var gx, gy, gz, c, p;
   for (p = 0; p < nP; p++) {
@@ -2960,57 +2678,18 @@ FluidSolver.prototype._heatBinScanSerial = function () {
   hCur.set(hStart.subarray(0, nCells));
 };
 
-// MT: bin-count chunks wrote per-worker partial counts — sum them, then run
-// the (cheap, O(nCells)) prefix scan on the coordinator.
-FluidSolver.prototype._heatBinScanMT = function () {
-  var nP = this.nP;
-  var nCells = this.nCells;
-  var hCnt = this._hCnt, hStart = this._hStart, hCur = this._hCur, hOrd = this._hOrd;
-  if (hCnt.length !== nCells) {
-    hCnt = this._hCnt = this._alloc('_hCnt', Int32Array, nCells);
-    hStart = this._hStart = this._alloc('_hStart', Int32Array, nCells + 1);
-    hCur = this._hCur = this._alloc('_hCur', Int32Array, nCells);
-  }
-  if (hOrd.length < nP) hOrd = this._hOrd = this._alloc('_hOrd', Int32Array, this.capacity * 2);
-  hCnt.fill(0);
-  var ctx = this._mtCtx, w, c, P;
-  for (w = 0; w < ctx.nWorkers; w++) {
-    P = this._mt.heatCountView(w);
-    for (c = 0; c < nCells; c++) hCnt[c] += P[c];
-  }
-  var acc = 0;
-  for (c = 0; c < nCells; c++) { hStart[c] = acc; acc += hCnt[c]; }
-  hStart[nCells] = acc;
-  hCur.set(hStart.subarray(0, nCells));
-};
-
-FluidSolver.prototype._heatBinCount = function (p0, p1, cnt) {
-  var px = this.px, py = this.py, pz = this.pz;
-  var nx = this.nx, ny = this.ny, nz = this.nz, dx = this.dx;
-  var p, gx, gy, gz;
-  for (p = p0; p < p1; p++) {
-    gx = px[p] / dx | 0; if (gx < 0) gx = 0; else if (gx >= nx) gx = nx - 1;
-    gy = py[p] / dx | 0; if (gy < 0) gy = 0; else if (gy >= ny) gy = ny - 1;
-    gz = pz[p] / dx | 0; if (gz < 0) gz = 0; else if (gz >= nz) gz = nz - 1;
-    cnt[(gz * ny + gy) * nx + gx]++;
-  }
-};
-
-// Bin-fill: particles land in their cell's bin. MT uses an atomic bump on the
-// shared cursor (bin order interleaves; the thermal means are order-free).
+// Bin-fill: particles land in their cell's bin (index order — deterministic).
 FluidSolver.prototype._heatBinFill = function (p0, p1) {
   var px = this.px, py = this.py, pz = this.pz;
   var nx = this.nx, ny = this.ny, nz = this.nz, dx = this.dx;
   var hCur = this._hCur, hOrd = this._hOrd;
-  var mt = this._mt;
   var p, gx, gy, gz, c;
   for (p = p0; p < p1; p++) {
     gx = px[p] / dx | 0; if (gx < 0) gx = 0; else if (gx >= nx) gx = nx - 1;
     gy = py[p] / dx | 0; if (gy < 0) gy = 0; else if (gy >= ny) gy = ny - 1;
     gz = pz[p] / dx | 0; if (gz < 0) gz = 0; else if (gz >= nz) gz = nz - 1;
     c = (gz * ny + gy) * nx + gx;
-    if (mt) hOrd[Atomics.add(hCur, c, 1)] = p;
-    else hOrd[hCur[c]++] = p;
+    hOrd[hCur[c]++] = p;
   }
 };
 
@@ -3020,7 +2699,11 @@ FluidSolver.prototype._heatShadowChunk = function (p0, p1, dt) {
   var px = this.px, py = this.py, pz = this.pz, pT = this.pT, fl = this.pflag;
   var pLight = this.pLight;   // exposure mirror for the renderer (shading)
   if ((!pLight || pLight.length < nP)) {
-    pLight = this.pLight = this._alloc('pLight', Float32Array, this._mt ? this.capacity : nP);
+    pLight = this.pLight = this._alloc('pLight', Float32Array, nP);
+  }
+  var pDepth = this.pDepth;   // water cells stacked over each particle (beads cull)
+  if ((!pDepth || pDepth.length < nP)) {
+    pDepth = this.pDepth = this._alloc('pDepth', Uint8Array, nP);
   }
   var nx = this.nx, ny = this.ny, nz = this.nz, dx = this.dx;
   var cx = this.cx, cy = this.cy, cz = this.cz, coreR2 = this.coreR * this.coreR;
@@ -3034,22 +2717,27 @@ FluidSolver.prototype._heatShadowChunk = function (p0, p1, dt) {
   var type = this.cellType;
   for (p = p0; p < p1; p++) {
     var lit = sun ? 1 : 0;          // no sun at all = night for everyone
+    // how much water sits over this particle (march outward): 0 = at/above
+    // the local surface, 4+ = deep interior. Mirrored for the renderer, which
+    // skips beads for interior water (invisible under the surface anyway —
+    // drawing them shaded-to-black showed as dark speckle through the body).
+    var dwx = px[p] - cx, dwy = py[p] - cy, dwz = pz[p] - cz;
+    var dwl = Math.sqrt(dwx * dwx + dwy * dwy + dwz * dwz) || 1e-9;
+    var stpU = dx / dwl, above = 0;
+    for (var stU = 1; stU <= 4; stU++) {
+      var qxU = px[p] + dwx * stpU * stU, qyU = py[p] + dwy * stpU * stU, qzU = pz[p] + dwz * stpU * stU;
+      var qiU = qxU / dx | 0, qjU = qyU / dx | 0, qkU = qzU / dx | 0;
+      if (qiU < 0 || qjU < 0 || qkU < 0 || qiU >= nx || qjU >= ny || qkU >= nz) break;
+      if (type[(qkU * ny + qjU) * nx + qiU] !== FLUID) break;
+      above++;
+    }
+    pDepth[p] = above;
     if (sun) {
       // deep-water fast path: four fluid cells stacked overhead mean optically
       // thick water above — the shadow and optical-depth marches below can
       // only return "opaque", so lit = 0 without walking up to 26 voxel steps
       // (this cull carries most of the ocean; surface-band particles skip it
       // and take the full shadow path, and airborne vapor never qualifies).
-      var dwx = px[p] - cx, dwy = py[p] - cy, dwz = pz[p] - cz;
-      var dwl = Math.sqrt(dwx * dwx + dwy * dwy + dwz * dwz) || 1e-9;
-      var stpU = dx / dwl, above = 0;
-      for (var stU = 1; stU <= 4; stU++) {
-        var qxU = px[p] + dwx * stpU * stU, qyU = py[p] + dwy * stpU * stU, qzU = pz[p] + dwz * stpU * stU;
-        var qiU = qxU / dx | 0, qjU = qyU / dx | 0, qkU = qzU / dx | 0;
-        if (qiU < 0 || qjU < 0 || qkU < 0 || qiU >= nx || qjU >= ny || qkU >= nz) break;
-        if (type[(qkU * ny + qjU) * nx + qiU] !== FLUID) break;
-        above++;
-      }
       if (above >= 4) lit = 0;
       else {
       var lx = sun[0] - px[p], ly = sun[1] - py[p], lz = sun[2] - pz[p];
@@ -3117,8 +2805,22 @@ FluidSolver.prototype._heatShadowChunk = function (p0, p1, dt) {
       var airK = sun ? 0.16 + (1 - lit) * 0.20 : 1.2;
       T = pT[p] + (airAmb - pT[p]) * airK * dt;
       if (lit > 0) T += sunPow * 0.6 * lit * dt;
+    } else if (fl[p] === 3) {
+      // cloud droplets: same sky ambient as steam, milder coupling (the
+      // condensate holds its latent heat longer), gentler solar gain
+      var cldAmb = lit > 0.05 ? Tamb + 0.18 : 0.06;
+      var cldK = sun ? 0.10 + (1 - lit) * 0.12 : 0.9;
+      T = pT[p] + (cldAmb - pT[p]) * cldK * dt;
+      if (lit > 0) T += sunPow * 0.35 * lit * dt;
     } else {
-      T = pT[p] + (Tamb - pT[p]) * (dissip + (1 - lit) * shadeCool) * dt;
+      // liquid (and freezing rain / snow): the relaxation target is the sun
+      // state — lit water rides the ocean ambient, but water seeing NO sun
+      // radiation (night side, terrain shade, depth) radiates to space and
+      // cools all the way to 0. Warm neighbours still share heat through the
+      // conservative conduction below, so sheltered water stays warm exactly
+      // as long as its surroundings do.
+      var watAmb = lit > 0.05 ? Tamb : 0;
+      T = pT[p] + (watAmb - pT[p]) * (dissip + (1 - lit) * shadeCool) * dt;
       if (lit > 0) T += sunPow * lit * dt;
     }
     if (T > 1.15) T = 1.15; else if (T < 0) T = 0;
@@ -3224,14 +2926,17 @@ FluidSolver.prototype._updateEvaporation = function (dt) {
   this.evapCount = this._evapChunk(0, this.nP, dt, Tmin, Tmax);
 };
 
-// Live water temperature range (coldest → hottest) over a particle chunk —
-// workers write per-chunk [Tmin, Tmax] partials the coordinator reduces.
+// Live water temperature range over the EVAPORATION-ELIGIBLE population
+// (above the evaporation point) — the ejection probability curve is
+// normalized across the water that can actually leave. Serial helper.
 FluidSolver.prototype._evapRangeChunk = function (p0, p1) {
   var pT = this.pT, fl = this.pflag;
+  var evapGate = this.evapT * 1.05;
   var Tmin = Infinity, Tmax = -Infinity, T, q;
   for (q = p0; q < p1; q++) {
     if (fl[q] === 2) continue;
     T = pT[q];
+    if (T < evapGate) continue;   // below the evaporation point: ineligible
     if (T < Tmin) Tmin = T;
     if (T > Tmax) Tmax = T;
   }
@@ -3239,10 +2944,14 @@ FluidSolver.prototype._evapRangeChunk = function (p0, p1) {
 };
 
 // Surface ejection pass (per particle, chunkable; the RNG stream is re-seeded
-// per chunk by the MT runner). Returns the chunk's evaporation count.
+// per chunk). Returns the chunk's evaporation count. Water only leaves for
+// the sky once heated 5% ABOVE the evaporating point (the vapor point
+// slider; the rain point is the same phase equilibrium seen from the air
+// side) — colder surface water stays put however sunny it is.
 FluidSolver.prototype._evapChunk = function (p0, p1, dt, Tmin, Tmax) {
   var rate = this.sunActivity;
   if (rate <= 0) return 0;
+  var evapGate = this.evapT * 1.05;
   var px = this.px, py = this.py, pz = this.pz, pT = this.pT;
   var fl = this.pflag, pAir = this.pAir;
   var pvx = this.pvx, pvy = this.pvy, pvz = this.pvz;
@@ -3262,6 +2971,7 @@ FluidSolver.prototype._evapChunk = function (p0, p1, dt, Tmin, Tmax) {
     if (k < 1) k = 1; else if (k > nz - 2) k = nz - 2;
     var c = (k * ny + j) * nx + i;
     if (type[c] !== FLUID) continue;
+    if (T < evapGate) continue;   // below the evaporation point: no take-off
     // surface-top: no fluid in the neighbouring cell along local "up"
     if (sphere) {
       var ex = px[p] - cx, ey = py[p] - cy, ez = pz[p] - cz;
@@ -3274,8 +2984,11 @@ FluidSolver.prototype._evapChunk = function (p0, p1, dt, Tmin, Tmax) {
     } else if (j + 1 <= ny - 2 && type[c + nx] === FLUID) {
       continue;
     }
-    // exponential heat-gated probability (seeded, deterministic)
-    var tau = (T - Tmin) * invSpan;
+    // exponential heat-gated probability (seeded, deterministic). τ is
+    // measured DOWN from the hottest eligible water so the hottest surface
+    // parcel always sits at τ = 1 (full probability) even when the eligible
+    // band is narrow or degenerate (single eligible particle).
+    var tau = 1 - (Tmax - T) * invSpan;
     if (tau < 0) tau = 0; else if (tau > 1) tau = 1;
     var prob = rate * 1.6 * dt * Math.exp(C * (tau - 1));
     this._evS = (this._evS * 1664525 + 1013904223) >>> 0;
@@ -3301,10 +3014,24 @@ FluidSolver.prototype._evapChunk = function (p0, p1, dt, Tmin, Tmax) {
       if (kUp < 0) {                                       // mirror to the sky
         kx -= 2 * kUp * ex2 / elL; ky -= 2 * kUp * ey2 / elL; kz -= 2 * kUp * ez2 / elL;
       }
-      pvx[p] += kx; pvy[p] += ky; pvz[p] += kz;
+      // no-slip leave-taking: the fresh parcel keeps the surface's normal
+      // motion and adopts the local TANGENTIAL flow of the surface it leaves
+      // (MAC-grid velocity sampled at the generation site, projected onto
+      // the tangent plane) — then the MB thermal kick on top
+      var guS = this.u.length ? this.u[(k * ny + j) * (nx + 1) + i] : 0;
+      var gvS = this.v.length ? this.v[(k * (ny + 1) + j) * nx + i] : 0;
+      var gwS = this.w.length ? this.w[(k * ny + j) * nx + i] : 0;
+      var nl2 = 1 / el2, vN = (pvx[p] * ex2 + pvy[p] * ey2 + pvz[p] * ez2) * nl2;
+      var vNx = vN * ex2, vNy = vN * ey2, vNz = vN * ez2;           // normal part (kept)
+      var gN = (guS * ex2 + gvS * ey2 + gwS * ez2) * nl2;
+      var vtx = guS - gN * ex2, vty = gvS - gN * ey2, vtz = gwS - gN * ez2;   // tangential flow
+      pvx[p] = vNx + vtx + kx; pvy[p] = vNy + vty + ky; pvz[p] = vNz + vtz + kz;
     } else {
       if (ky < 0) ky = -ky;                                // pool: up is +y
-      pvx[p] += kx; pvy[p] += ky; pvz[p] += kz;
+      // no-slip: horizontal components adopt the local surface flow
+      var guB = this.u.length ? this.u[(k * ny + j) * (nx + 1) + i] : 0;
+      var gwB = this.w.length ? this.w[(k * ny + j) * nx + i] : 0;
+      pvx[p] = guB + kx; pvy[p] += ky; pvz[p] = gwB + kz;
     }
     evapN++;
   }
@@ -3320,7 +3047,205 @@ FluidSolver.prototype._evGauss = function () {
   return Math.sqrt(-2 * Math.log(u1)) * Math.cos(6.283185306 * (this._evS / 4294967296));
 };
 
+// --------------------------------------------------------- phase changes
+// Substates of the evaporated particle, evaluated once per frame (serial on
+// the coordinator, like _vaporCollisions — the 27-cell steam density scan is
+// cheap next to the collision sweep):
+//   steam (2) → rain (4)      T ≤ rainT            (only steam rains out)
+//   steam (2) → cloud (3)     T ≤ cloudT AND local steam density ≥ cloudP,
+//                             above the cloud base (30% of the atmosphere)
+//   cloud (3) → steam (2)     T ≥ cloudT + 0.05    (sun-warmed clouds burn off)
+//   water (0)/rain (4) → snow (5)   T ≤ snowT      (frozen — stops moving)
+//   snow (5) → water (0)      T ≥ meltT (5% above the snow point) and inside
+//                             the liquid
+//   snow (5) → rain (4)       T ≥ meltT, airborne (falls, then lands)
+// rainT/snowT are ordering-clamped below cloudT/rainT so slider combinations
+// can never invert the chain.
+// Per-particle deterministic hash — the
+// spin seeder must produce IDENTICAL values across runs so the
+// parity contract holds.
+FluidSolver.prototype._spinHash = function (a, b, c) {
+  var s = (a ^ (b * 0x9e3779b9) ^ (c * 0x85ebca6b) ^ (0x51ab3c77 * 0xc2b2ae35)) >>> 0;
+  s = (s * 1664525 + 1013904223) >>> 0;
+  s ^= s >>> 13; s = (s * 0x5bd1e995) >>> 0; s ^= s >>> 15;
+  return s >>> 0;
+};
+
+FluidSolver.prototype._updatePhaseChanges = function (dt) {
+  var nP = this.nP, fl = this.pflag, pT = this.pT;
+  var px = this.px, py = this.py, pz = this.pz;
+  var nx = this.nx, ny = this.ny, nz = this.nz, dx = this.dx;
+  var cnt = this._steamCnt;
+  cnt.fill(0);
+  var p, i, j, k, c;
+  for (p = 0; p < nP; p++) {
+    if (fl[p] !== 2) continue;
+    i = px[p] / dx | 0; j = py[p] / dx | 0; k = pz[p] / dx | 0;
+    if (i < 0) i = 0; else if (i >= nx) i = nx - 1;
+    if (j < 0) j = 0; else if (j >= ny) j = ny - 1;
+    if (k < 0) k = 0; else if (k >= nz) k = nz - 1;
+    cnt[(k * ny + j) * nx + i]++;
+  }
+  var cloudT = this.cloudT, cloudP = this.cloudP;
+  var rainT = Math.min(this.rainT, cloudT - 0.02); if (rainT < 0) rainT = 0;
+  var snowT = Math.min(this.snowT, rainT - 0.02); if (snowT < 0) snowT = 0;
+  // ice must be heated 5% ABOVE the freezing point to melt back (the UI
+  // slider can raise it further; the +5% band is the invariant minimum so
+  // freezing and melting can never chatter at the same temperature)
+  var meltT = this.meltT > snowT * 1.05 ? this.meltT : snowT * 1.05;
+  var type = this.cellType, FL = FLUID;
+  var sphere = this.mode === 'sphere';
+  var cloudBase = sphere ? this.oceanR + 0.3 * this.atmosphereH
+                         : this.waterTopY + 0.3 * this.atmosphereH;
+  var cx = this.cx, cy = this.cy, cz = this.cz;
+  for (p = 0; p < nP; p++) {
+    var f = fl[p];
+    // pT === 0 marks "thermal never ran" (box-mode tests, first frame) —
+    // never treat it as absolute-zero cold. Water freezes only at a
+    // fluid–air interface (sea/pond surface): deep water cannot shed its
+    // latent heat to the sky, and freezing mid-ocean would strand the
+    // embedded-particle rescue.
+    if (f === 0) {
+      if (pT[p] <= snowT && pT[p] > 1e-3) {
+        i = px[p] / dx | 0; j = py[p] / dx | 0; k = pz[p] / dx | 0;
+        if (i < 0) i = 0; else if (i >= nx) i = nx - 1;
+        if (j < 0) j = 0; else if (j >= ny) j = ny - 1;
+        if (k < 0) k = 0; else if (k >= nz) k = nz - 1;
+        var cB = (k * ny + j) * nx + i;
+        var atSurf = (k > 0 && type[cB - nx * ny] !== FL) || (k < nz - 1 && type[cB + nx * ny] !== FL) ||
+                     (j > 0 && type[cB - nx] !== FL) || (j < ny - 1 && type[cB + nx] !== FL) ||
+                     (i > 0 && type[cB - 1] !== FL) || (i < nx - 1 && type[cB + 1] !== FL);
+        if (atSurf) {
+          fl[p] = 5; this.pvx[p] = this.pvy[p] = this.pvz[p] = 0;
+          this.pAir[p] = 1;   // sea/pond ice: already resting at the surface → stuck
+        }
+      }
+      continue;
+    }
+    if (f === 5) {
+      if (pT[p] >= meltT) {
+        i = px[p] / dx | 0; j = py[p] / dx | 0; k = pz[p] / dx | 0;
+        if (i < 0) i = 0; else if (i >= nx) i = nx - 1;
+        if (j < 0) j = 0; else if (j >= ny) j = ny - 1;
+        if (k < 0) k = 0; else if (k >= nz) k = nz - 1;
+        fl[p] = type[(k * ny + j) * nx + i] === FL ? 0 : 4;
+        this.pAir[p] = 0;
+        this.pWx[p] = this.pWy[p] = this.pWz[p] = 0;
+      }
+      continue;
+    }
+    var T = pT[p];
+    if (T <= 1e-3) continue;                                      // thermal not live
+    if (f === 2) {
+      if (T <= rainT) { fl[p] = 4; this.pAir[p] = 0; this.pWx[p] = this.pWy[p] = this.pWz[p] = 0; continue; }   // rains out
+      if (T > cloudT) continue;                                     // too warm for cloud
+      if (sphere) {
+        if (Math.sqrt((px[p] - cx) * (px[p] - cx) + (py[p] - cy) * (py[p] - cy) + (pz[p] - cz) * (pz[p] - cz)) < cloudBase) continue;
+      } else if (py[p] < cloudBase) continue;
+      // steam density: count in the 3×3×3 cell neighbourhood (pressure proxy)
+      i = px[p] / dx | 0; j = py[p] / dx | 0; k = pz[p] / dx | 0;
+      var i0 = i > 0 ? i - 1 : 0, i1 = i < nx - 1 ? i + 1 : nx - 1;
+      var j0 = j > 0 ? j - 1 : 0, j1 = j < ny - 1 ? j + 1 : ny - 1;
+      var k0 = k > 0 ? k - 1 : 0, k1 = k < nz - 1 ? k + 1 : nz - 1;
+      var sum = 0;
+      for (var kk = k0; kk <= k1; kk++) for (var jj = j0; jj <= j1; jj++) {
+        var row = (kk * ny + jj) * nx;
+        for (var ii = i0; ii <= i1; ii++) sum += cnt[row + ii];
+      }
+      if (sum / 27 >= cloudP) { fl[p] = 3; this.pAir[p] = 0; }
+      continue;
+    }
+    if (f === 3) {
+      if (T >= cloudT + 0.05) fl[p] = 2;   // burned off by the sun
+      continue;
+    }
+    // f === 4 (rain): freezes into snow when even colder; landing rules
+    // (FLUID contact / terrain / floor film) absorb it back into the liquid.
+    // Freezing rain stays FREE (pAir 0) — it falls as ice until it touches
+    // terrain or another ice particle (see _iceContacts / the motion pass).
+    if (T <= snowT) { fl[p] = 5; this.pvx[p] = this.pvy[p] = this.pvz[p] = 0; this.pAir[p] = 0; this.pWx[p] = this.pWy[p] = this.pWz[p] = 0; }
+  }
+  // ---- particle rotation bookkeeping (airborne family, fl 2/3) ----------
+  // Fresh steam (pAir 0 — just ejected by the MB sampler) is seeded with a
+  // thermally excited spin: random axis, speed σ·√T. Spin then damps gently
+  // in the air and advances the render phase. Deterministic per (seed, p, tick).
+  if (this.spinOn && this.pWx && this.pWx.length >= nP && dt > 0) {
+    var pWx = this.pWx, pWy = this.pWy, pWz = this.pWz, pPh = this.pPh;
+    var tick = (this._simTime * 60) | 0, sd = 0x51ab3c77;
+    var damp = dt > 0 ? Math.max(0, 1 - 0.12 * dt) : 1;
+    for (p = 0; p < nP; p++) {
+      f = fl[p];
+      if (f !== 2 && f !== 3) continue;
+      if (f === 2 && this.pAir[p] <= 1e-6 && pWx[p] === 0 && pWy[p] === 0 && pWz[p] === 0) {
+        // thermal spin seed: uniform random axis (z–θ parametrization)
+        var h1 = this._spinHash(sd, p, tick) / 4294967296;
+        var h2 = this._spinHash(sd + 1, p, tick) / 4294967296;
+        var h3 = this._spinHash(sd + 2, p, tick) / 4294967296;
+        var zz = 2 * h2 - 1, rr = Math.sqrt(Math.max(0, 1 - zz * zz)), th = 6.283185306 * h1;
+        var Tp = pT[p]; if (!(Tp > 0.05)) Tp = 0.05; else if (Tp > 1.15) Tp = 1.15;
+        var wSpd = 3.0 * Math.sqrt(Tp) * (0.5 + h3);
+        pWx[p] = rr * Math.cos(th) * wSpd; pWy[p] = zz * wSpd; pWz[p] = rr * Math.sin(th) * wSpd;
+      }
+      var wm = Math.sqrt(pWx[p] * pWx[p] + pWy[p] * pWy[p] + pWz[p] * pWz[p]);
+      if (wm > 1e-6) pPh[p] += wm * dt;
+      pWx[p] *= damp; pWy[p] *= damp; pWz[p] *= damp;
+    }
+  }
+};
+
+// ---------------------------------------------------- ice contact sweep
+// Ice is adhesive: a FREE (falling) snow particle that touches TERRAIN stops
+// for good (the motion pass handles that), and one that touches an already
+// STUCK particle aggregates onto the pack. Two FREE particles that touch
+// each other stick to one another — equal masses adopt the mean velocity
+// (perfectly inelastic pairing), then keep falling as a pair. Serial sweep
+// with the same sorted-x slab strategy as _vaporCollisions.
+FluidSolver.prototype._iceContacts = function () {
+  var fl = this.pflag, nP = this.nP, pAir = this.pAir;
+  var nI = 0, iceIdx = this._iceIdx;
+  var px = this.px, py = this.py, pz = this.pz;
+  for (var p = 0; p < nP; p++) {
+    if (fl[p] !== 5) continue;
+    if (iceIdx.length <= nI) iceIdx.push(0);
+    iceIdx[nI++] = p;
+  }
+  if (nI < 2) return;
+  var pvx = this.pvx, pvy = this.pvy, pvz = this.pvz;
+  var rad = this.spacing * 0.7, rad2 = rad * rad;
+  iceIdx.length = nI;
+  iceIdx.sort(function (a, b) { return px[a] - px[b] || a - b; });
+  for (var a = 0; a < nI; a++) {
+    var i = iceIdx[a];
+    var stuckI = pAir[i] === 1;
+    for (var b = a + 1; b < nI; b++) {
+      var j = iceIdx[b];
+      if (px[j] - px[i] >= rad) break;
+      var ddx = px[j] - px[i], ddy = py[j] - py[i], ddz = pz[j] - pz[i];
+      if (ddx * ddx + ddy * ddy + ddz * ddz >= rad2) continue;
+      var stuckJ = pAir[j] === 1;
+      if (stuckI && stuckJ) continue;
+      if (stuckJ) {          // free i lands on the pack at j
+        pAir[i] = 1; pvx[i] = pvy[i] = pvz[i] = 0; stuckI = true;
+      } else if (stuckI) {   // free j lands on the pack at i
+        pAir[j] = 1; pvx[j] = pvy[j] = pvz[j] = 0;
+      } else {               // two free grains: inelastic pairing (mean velocity)
+        var mx = (pvx[i] + pvx[j]) * 0.5, my = (pvy[i] + pvy[j]) * 0.5, mz = (pvz[i] + pvz[j]) * 0.5;
+        pvx[i] = pvx[j] = mx; pvy[i] = pvy[j] = my; pvz[i] = pvz[j] = mz;
+      }
+    }
+  }
+};
+
 // ------------------------------------------------- embedded particle rescue
+// Realistic collisions between airborne particles. Steam/cloud pairs collide
+// with each other (below); every airborne parcel additionally collides with
+// LIQUID particles it touches — ocean surface skin, spray and rain. The
+// liquid body acts as a moving boundary (a droplet is nothing next to the
+// sea): the parcel reflects off the LOCAL water velocity with restitution
+// 0.4, overlap separates by displacing only the parcel, and a soft buoyant
+// kick keeps vapor resting ON the sea instead of sinking into it. The water
+// itself is never pushed — the FLIP grid owns the ocean's momentum.
+
 // Realistic collisions between airborne vapor particles: approaching pairs
 // closer than a particle diameter exchange their velocity component along
 // the contact normal (the equal-mass elastic collision solution); ALL
@@ -3332,19 +3257,25 @@ FluidSolver.prototype._evGauss = function () {
 // crowded.
 FluidSolver.prototype._vaporCollisions = function () {
   var fl = this.pflag, nP = this.nP;
-  var nV = 0, vIdx = this._vIdx, night = 0;
+  var nV = 0, vIdx = this._vIdx, night = 0, nSteam = 0;
   var sun = this.sunPos;
   var sx = sun ? sun[0] - this.cx : 0, sy = sun ? sun[1] - this.cy : 0, sz = sun ? sun[2] - this.cz : 0;
   for (var p = 0; p < nP; p++) {
-    if (fl[p] !== 2) continue;
+    var fp = fl[p];
+    if (fp !== 2 && fp !== 3) continue;   // steam + cloud droplets both collide
     if (vIdx.length <= nV) vIdx.push(0);
     vIdx[nV++] = p;
-    if (!sun || (this.px[p] - this.cx) * sx + (this.py[p] - this.cy) * sy + (this.pz[p] - this.cz) * sz < 0) night++;
+    if (fp === 2) {                        // the census stays steam-only
+      nSteam++;
+      if (!sun || (this.px[p] - this.cx) * sx + (this.py[p] - this.cy) * sy + (this.pz[p] - this.cz) * sz < 0) night++;
+    }
   }
-  this.vaporCount = nV; this.nightVaporCount = night;
+  this.vaporCount = nSteam; this.nightVaporCount = night;
   if (nV < 2) return;
   var px = this.px, py = this.py, pz = this.pz;
   var pvx = this.pvx, pvy = this.pvy, pvz = this.pvz;
+  var pWx = this.pWx, pWy = this.pWy, pWz = this.pWz;
+  var spinOn = this.spinOn && pWx && pWx.length >= nP;
   var rad = this.spacing * 0.6, rad2 = rad * rad;
   // Sort once along x, then sweep only overlapping slabs. Unlike the old
   // quadratic all-pairs scan, a crowded atmosphere never disables collisions.
@@ -3376,6 +3307,86 @@ FluidSolver.prototype._vaporCollisions = function () {
       var kick = (rad - d) * 2;
       pvx[i] -= nX * kick; pvy[i] -= nY * kick; pvz[i] -= nZ * kick;
       pvx[j] += nX * kick; pvy[j] += nY * kick; pvz[j] += nZ * kick;
+      if (!spinOn) continue;
+      // ---- rotational coupling (equal solid spheres, m = 1, I = 2/5·R²) --
+      // Surface slip at the contact point u = (v_i − v_j) + R·(ω_i+ω_j)×n̂
+      // drives a friction impulse that opposes the slip: linear energy
+      // drains into rotation (and a Coulomb-capped remainder dissipates) —
+      // the natural billiard-ball redistribution, applied per contact.
+      var R = rad * 0.5;
+      var wSx = pWx[i] + pWx[j], wSy = pWy[i] + pWy[j], wSz = pWz[i] + pWz[j];
+      var usx = (pvx[i] - pvx[j]) + R * (wSy * nZ - wSz * nY);
+      var usy = (pvy[i] - pvy[j]) + R * (wSz * nX - wSx * nZ);
+      var usz = (pvz[i] - pvz[j]) + R * (wSx * nY - wSy * nX);
+      var uN = usx * nX + usy * nY + usz * nZ;
+      var utx = usx - uN * nX, uty = usy - uN * nY, utz = usz - uN * nZ;
+      var utM = Math.sqrt(utx * utx + uty * uty + utz * utz);
+      if (utM < 1e-9) continue;
+      // slip-killing impulse for solid spheres is |u_t|/7 (Δu_t = 7·J_t);
+      // Coulomb: friction can never exceed μ × the normal impulse (vRel)
+      var jt = utM / 7;
+      if (vRel > 0) { var mu = 0.25 * vRel; if (jt > mu) jt = mu; }
+      var jx = -utx / utM * jt, jy = -uty / utM * jt, jz = -utz / utM * jt;
+      pvx[i] += jx; pvy[i] += jy; pvz[i] += jz;
+      pvx[j] -= jx; pvy[j] -= jy; pvz[j] -= jz;
+      // Δω_i = (R·n̂ × J)/I and the same for j (opposite arm × opposite
+      // impulse — the pair co-rotates, verified against the gear intuition)
+      var invI = 1 / (0.4 * R * R);
+      var dwx = R * (nY * jz - nZ * jy) * invI;
+      var dwy = R * (nZ * jx - nX * jz) * invI;
+      var dwz = R * (nX * jy - nY * jx) * invI;
+      pWx[i] += dwx; pWy[i] += dwy; pWz[i] += dwz;
+      pWx[j] += dwx; pWy[j] += dwy; pWz[j] += dwz;
+    }
+  }
+  // ---- airborne × liquid contacts -------------------------------------------
+  // Walk the LIQUID population (ocean surface band, spray, rain) against the
+  // sorted vapor list: binary search the x-window, test the pair distance,
+  // resolve as a parcel-vs-boundary contact. Runs in O(W·log V + hits).
+  if (nV < 1) return;
+  var dxc = this.dx;
+  var sphere2 = this.mode === 'sphere';
+  var band = this.oceanR - dxc * 2, bandLo2 = band * band;
+  var topY = this.waterTopY - dxc * 2;
+  var radW = rad, radW2 = rad2;
+  for (p = 0; p < nP; p++) {
+    var fw = fl[p];
+    if (fw !== 0 && fw !== 1 && fw !== 4) continue;
+    var wx = px[p], wy = py[p], wz = pz[p];
+    if (fw === 0) {   // liquid: only the surface band ever meets the air
+      if (sphere2) {
+        var dwx2 = wx - this.cx, dwy2 = wy - this.cy, dwz2 = wz - this.cz;
+        if (dwx2 * dwx2 + dwy2 * dwy2 + dwz2 * dwz2 < bandLo2) continue;
+      } else if (wy < topY) continue;
+    }
+    // binary search the sorted vapor list for the x window
+    var lo = 0, hi = nV;
+    while (lo < hi) { var mid = (lo + hi) >> 1; if (px[vIdx[mid]] < wx - radW) lo = mid + 1; else hi = mid; }
+    for (var b2 = lo; b2 < nV; b2++) {
+      var j2 = vIdx[b2];
+      var ddx2 = px[j2] - wx;
+      if (ddx2 >= radW) break;
+      var ddy2 = py[j2] - wy, ddz2 = pz[j2] - wz;
+      var dd2 = ddx2 * ddx2 + ddy2 * ddy2 + ddz2 * ddz2;
+      if (dd2 >= radW2 || dd2 < 1e-12) continue;
+      var dd = Math.sqrt(dd2);
+      var nX2 = ddx2 / dd, nY2 = ddy2 / dd, nZ2 = ddz2 / dd;
+      // relative normal velocity of the PARCEL against the local water
+      // (n̂ points water → vapor; approaching = negative)
+      var vR2 = (pvx[j2] - pvx[p]) * nX2 + (pvy[j2] - pvy[p]) * nY2 + (pvz[j2] - pvz[p]) * nZ2;
+      if (vR2 < 0) {
+        // reflect the parcel's normal motion off the moving surface with
+        // restitution 0.4 — a wet splash, not a billiard shot
+        var vB = vR2 * (1 + 0.4);
+        pvx[j2] -= vB * nX2; pvy[j2] -= vB * nY2; pvz[j2] -= vB * nZ2;
+      }
+      // separate the overlap — only the parcel moves (the sea is immovable
+      // at droplet scale); displace it fully out of the liquid
+      var ov2 = radW - dd;
+      px[j2] += nX2 * ov2; py[j2] += nY2 * ov2; pz[j2] += nZ2 * ov2;
+      // soft buoyant kick: vapor resting on the sea rides upward, never sinks
+      var kk2 = ov2 * 2;
+      pvx[j2] += nX2 * kk2; pvy[j2] += nY2 * kk2; pvz[j2] += nZ2 * kk2;
     }
   }
 };
@@ -3401,6 +3412,7 @@ FluidSolver.prototype._pushSurfaceChunk = function (p0, p1) {
   var pvx = this.pvx, pvy = this.pvy, pvz = this.pvz, fl = this.pflag;
   var cx = this.cx, cy = this.cy, cz = this.cz, dx = this.dx;
   for (var p = p0; p < p1; p++) {
+    if (fl[p] === 5) continue;   // snow is frozen — never repositioned
     var x = px[p], y = py[p], z = pz[p];
     var ex = x - cx, ey = y - cy, ez = z - cz;
     var er = Math.sqrt(ex * ex + ey * ey + ez * ez) || 1e-9;

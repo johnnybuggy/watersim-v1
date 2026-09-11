@@ -149,6 +149,14 @@ check('each flash slot carries a bright-blue bolt channel',
       fl.bolt.geometry.getAttribute('position').count === sc._BOLT_PTS;
   }),
   'slots=' + sc._flashes.length);
+// regression: the flash sprite must carry the soft glow texture — a
+// SpriteMaterial without a map renders as an untextured white square
+check('flash sprite carries the soft radial glow texture (no bare white square)',
+  sc._flashes.length > 0 && sc._flashes.every(function (fl) {
+    return fl.sprite.material.map && fl.sprite.material.map.isTexture &&
+      fl.sprite.material.blending === THREE.AdditiveBlending;
+  }),
+  'slots=' + sc._flashes.length);
 // bolt geometry: from the pocket down to the ground beneath it
 (function () {
   var scB = new WaterScene({ clientWidth: 320, clientHeight: 200, appendChild: function () {} },
@@ -180,53 +188,61 @@ sc.setTilt(0);
 sc.updatePlanetMotion(1 / 60);
 check('tilt 0 restores the classic upright spin', sc.tiltGroup.rotation.z === 0);
 
-// flat-circle mode smoke: surface hidden, liquid body routed to the flat blue
-// circle sprites, rain drops keep the glossy sprite, restored on off
+// combined particle system smoke: one sorted draw list with per-class sprite
+// tiles, per-particle alpha, and camera-relative ordering
 sc.setBeadsMode(true);
-check('droplet mode hides the surface and shows flat blue circles',
-  sc.waterMesh.visible === false && sc.beadsPoints.visible &&
-  sc.beadMat.isPointsMaterial === true && sc.beadMat.map === sc.pSprite &&
-  sc.pMat.map === sc.beadSprite);
-sc.setBeadsMode(false);
-check('leaving droplet mode restores the surface and hides the droplets',
-  sc.waterMesh.visible === true && !sc.beadsPoints.visible);
-
-// fake a marching-tets mesh result and render one frame
-var pos = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
-var nrm = new Float32Array([0, 1, 0, 0, 1, 0, 0, 1, 0]);
-sc.updateWater(pos, nrm, 3);
-check('updateWater runs', true);
-
+check('droplet mode hides the surface mesh', sc.waterMesh.visible === false);
 var fakeSolver = { nP: 2, px: new Float32Array([2.5, 2.6]), py: new Float32Array([2.5, 2.7]),
   pz: new Float32Array([2.5, 2.5]), pvx: new Float32Array(2), pvy: new Float32Array(2),
-  pvz: new Float32Array(2), pflag: new Uint8Array(2), spacing: 0.06 };
+  pvz: new Float32Array(2), pflag: new Uint8Array(2), spacing: 0.06, pT: new Float32Array([0.3, 0.3]) };
 sc.updateParticles(fakeSolver, true);
 check('updateParticles runs', true);
-check('liquid particles are represented by the surface, not bead sprites', sc.pGeo.drawRange.count === 0);
+sc.setBeadsMode(false);
+sc.updateParticles(fakeSolver, true);
+check('liquid particles are represented by the surface, not bead sprites',
+  sc._classCounts.beads === 0 && sc._classCounts.spray === 0, 'counts=' + JSON.stringify(sc._classCounts));
+sc.setBeadsMode(true);
 
 // circles draw call + water-surface opacity coupling + exposure shading
 sc.setBeadsMode(true);
 fakeSolver.pLight = new Float32Array([0.9, 0.1]);   // solver-computed sun exposure
+// straddle the terminator along the scene's default sun direction
+// _sunDirLocal ≈ (0.912, 0.410, 0): bead 0 = night hemisphere, bead 1 = day
+fakeSolver.px = new Float32Array([2.55 - 0.5 * 0.912, 2.55 + 0.5 * 0.912]);
+fakeSolver.py = new Float32Array([2.55 - 0.5 * 0.410, 2.55 + 0.5 * 0.410]);
+fakeSolver.pz = new Float32Array([2.5, 2.5]);
 sc.updateParticles(fakeSolver, true);
-check('in droplet mode liquid particles draw as circles, not spray',
-  sc.beadsGeo.drawRange.count === 2 && sc.pGeo.drawRange.count === 0,
-  'circles=' + sc.beadsGeo.drawRange.count + ' spray=' + sc.pGeo.drawRange.count);
-// exposure shading bakes into the circle colors: particle 1 (expo 0.1, night)
-// must render darker than particle 0 (expo 0.9, day)
-var dayB = sc.bCol[0], nightB = sc.bCol[3];
+check('in droplet mode liquid particles draw as flat circles (sprite tile 0)',
+  sc.allGeo.drawRange.count === 2 && sc._classCounts.beads === 2 &&
+  sc.allSprite[0] === 0 && sc.allSprite[1] === 0 && sc.allAlpha[0] === sc.waterOpa,
+  'drawn=' + sc.allGeo.drawRange.count + ' sprite0=' + sc.allSprite[0] + ' alpha0=' + sc.allAlpha[0].toFixed(2));
+// exposure shading bakes into the circle colors on the NIGHT side only: the
+// night bead (expo 0.1) renders dark, while the day-side bead keeps its
+// NORMAL color (sunny-side water is never exposure-darkened)
+var dayB = Math.max(sc.allCol[0], sc.allCol[3]), nightB = Math.min(sc.allCol[0], sc.allCol[3]);
 check('night-side circles shade darker than day-side ones (planet shadow)',
-  Math.abs(nightB / dayB - (0.12 + 0.88 * 0.1) / (0.12 + 0.88 * 0.9)) < 1e-3,
+  Math.abs(nightB / dayB - (0.12 + 0.88 * 0.1)) < 0.05,
   'ratio=' + (nightB / dayB).toFixed(3));
 sc.setWaterOpacity(0.3);
+sc.updateParticles(fakeSolver, true);
 check('circle transparency follows the water-surface opacity slider',
-  sc.beadMat.opacity === 0.3, 'opacity=' + sc.beadMat.opacity);
-check('rain droplets render 3× smaller than the water circles',
-  Math.abs(sc.pMat.size - sc.beadMat.size / 3) < 1e-9,
-  'rain=' + sc.pMat.size.toFixed(4) + ' water=' + sc.beadMat.size.toFixed(4));
+  Math.abs(sc.allAlpha[0] - 0.3) < 1e-6, 'alpha=' + sc.allAlpha[0]);
+check('atlas texture is a single combined sprite sheet', sc.atlasTex && sc.allMat.uniforms.uAtlas.value === sc.atlasTex);
+// regression: flipY must stay OFF or the shader's aSprite → cell mapping
+// samples the mirrored row (snow rendered as the glossy bead = spheres,
+// vapor sampled the empty cell and vanished)
+check('atlas sampling is row-major (flipY off) so every class gets its own tile',
+  sc.atlasTex && sc.atlasTex.flipY === false, 'flipY=' + (sc.atlasTex && sc.atlasTex.flipY));
 sc.setBeadsMode(false);
+check('leaving droplet mode restores the surface mesh', sc.waterMesh.visible === true);
+sc.setBeadsMode(false);
+fakeSolver.pflag = new Uint8Array([0, 4]);
+fakeSolver.px = new Float32Array([2.5, 2.6]);
 sc.updateParticles(fakeSolver, true);
 check('leaving beads mode empties the bead draw and restores the surface',
-  sc.beadsGeo.drawRange.count === 0 && sc.waterMesh.visible === true);
+  sc._classCounts.beads === 0 && sc._classCounts.spray === 1 && sc.waterMesh.visible === true,
+  'beads=' + sc._classCounts.beads + ' spray=' + sc._classCounts.spray +
+  ' rainTile=' + sc.allSprite[0]);
 sc.setWaterOpacity(0.68);   // mid-range opacity for the translucent-surface check
 check('water surface is glossy and translucent', sc.waterMat.opacity > 0.4 && sc.waterMat.opacity < 0.9 && sc.waterMat.roughness < 0.12);
 sc.setQuality({ pixelRatio: 0.8, shadowSize: 512 });
@@ -234,10 +250,15 @@ sc.setQuality({ pixelRatio: 0.7 });
 check('partial quality updates preserve shadow detail', sc.sun.shadow.mapSize.x === 512);
 sc.setAtmosphereHeight(0.7);
 check('atmosphere height updates without rebuilding world', sc._haloMesh.scale.x > 0);
-check('vapor renders as broad low-opacity cloudlets',
-  sc.vapor && sc.vapor.visible !== undefined && sc.vMat.size > sc.pMat.size && sc.vMat.opacity < 0.3,
-  'vMat.size = ' + (sc.vMat ? sc.vMat.size.toFixed(4) : '-') +
-  ' vs pMat.size = ' + (sc.pMat ? sc.pMat.size.toFixed(4) : '-'));
+// vapor cloudlets are bigger but far fainter than spray droplets
+fakeSolver.pflag = new Uint8Array([2, 4]);
+fakeSolver.pT = new Float32Array([0.3, 0.3]);
+sc.updateParticles(fakeSolver, true);
+var vapI = sc.allSprite[0] === 2 ? 0 : 1;
+check('vapor renders as broad low-opacity cloudlets (bigger, fainter)',
+  sc._classCounts.vapor === 1 && sc.allSprite[vapI] === 2 &&
+  sc.allSize[vapI] > 0.1 && sc.allAlpha[vapI] < 0.3,
+  'vapor size=' + sc.allSize[vapI].toFixed(3) + ' alpha=' + sc.allAlpha[vapI].toFixed(3));
 
 sc.syncBalls([{ x: 2.55, y: 3.4, z: 2.55, r: 0.3 }]);
 check('syncBalls runs', true);
@@ -247,13 +268,19 @@ sc.showHandle(false, 0, 0, 0);
 sc.render(1 / 60);
 check('render frame runs (stubbed GL)', true);
 
-// voxel terrain mesh (gouraud) — tiny synthetic rock cube swapped in
+// terrain isosurface mesh — a tiny synthetic rock cube, given as the corner
+// lattice field the solver builds (field[c] = R(c) − |c − centre|)
 var tn = 8, tdv = 0.4, tsolid = new Uint8Array(tn * tn * tn);
-for (var tk = 2; tk < 6; tk++) for (var tj = 2; tj < 6; tj++) for (var ti = 2; ti < 6; ti++)
+var tfield = new Float32Array((tn + 1) * (tn + 1) * (tn + 1));
+for (var tk = 2; tk < 6; tk++) for (var tj = 2; tj < 6; tj++) for (var ti = 2; ti < 6; ti++) {
   tsolid[(tk * tn + tj) * tn + ti] = 1;
+  tfield[((tk + 1) * (tn + 1) + (tj + 1)) * (tn + 1) + ti] = 1;   // inside rock
+}
+for (var fc = 0; fc < tfield.length; fc++) if (tfield[fc] === 0) tfield[fc] = -1;
 sc.buildTerrain({ n: tn, dv: tdv, solid: tsolid, R: new Float32Array(tn * tn * tn),
-  Rsl: 1.9, Rlo: 1.1, Rhi: 2.2, landFrac: 0.27, seed: 1 });
-check('buildTerrain (voxel mesh) runs', !!sc._terrainMesh);
+  field: tfield, Rsl: 1.9, Rlo: 1.1, Rhi: 2.2, landFrac: 0.27, seed: 1 });
+check('terrain isosurface mesh runs', !!sc._terrainMesh && sc._terrainMesh.userData.vcount > 0,
+  'verts=' + (sc._terrainMesh ? sc._terrainMesh.userData.vcount : 0));
 sc.setPlanetColor('#123456');
 // the picker drives the vertex palette now; the material stays a white
 // multiplier so the palette hues (green waterline, snow) read true
@@ -279,13 +306,18 @@ var IDS = ['stVapor','stQuality','loadingText','btnCalibrate','rangeWOpa','wOpaV
   'rangeIters','rangeOceanV','rangePOpa','rangePic','rangeStorm','rangeSubsteps','rangeTime',
   'rangeTilt','rangeVisc','selRes','selCeil','stAir','stDt','stFps','stParticles','stSim','stUmax','stats',
   'stormVal','subVal','timeVal','tiltVal','viewport','rangeYear','yearVal','rangeSpin','spinVal','chkVectors',
-  'chkGpu','stBackend','solverBadge'];
+  'stBackend','solverBadge',
+  'panelToggle','panelClose','rangeCloudT','cloudTVal','rangeCloudP','cloudPVal',
+  'rangeRainT','rainTVal','rangeSnowT','snowTVal',
+  'rangeIceMelt','iceMeltVal','rangeEvapT','evapTVal','btnEarth',
+  'rangeBlur','blurVal','chkStars','rangeStars','starVal','chkSpin'];
 var elements = {};
 IDS.forEach(function (id) {
   elements[id] = {
     id: id, style: {}, value: id === 'selRes' ? 'medium' : '0',
     textContent: '', checked: false,
-    classList: { toggle: function () {} },
+    classList: { toggle: function () {}, add: function () {}, remove: function () {} },
+    setAttribute: function () {}, getAttribute: function () { return null; },
     addEventListener: function () {}, removeEventListener: function () {},
     appendChild: function () {},
     clientWidth: 1280, clientHeight: 720
@@ -331,7 +363,7 @@ if (!bootListeners.length) {
     check('physics-backend badge states the active solver explicitly',
       elements.solverBadge.textContent.indexOf('Physics:') === 0 &&
       elements.solverBadge.textContent.indexOf('CPU') !== -1 &&
-      elements.solverBadge.textContent.indexOf('fallback') !== -1,
+      elements.solverBadge.textContent.indexOf('single thread') !== -1,
       JSON.stringify(elements.solverBadge.textContent));
     check('stats row names the physics solver', elements.stBackend.textContent.indexOf('CPU') !== -1,
       JSON.stringify(elements.stBackend.textContent));

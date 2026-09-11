@@ -59,7 +59,31 @@ body {
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  transition: transform 0.28s ease, opacity 0.28s ease;
 }
+/* fully collapsible: collapsed by default (phones) — the fixed toggle
+   button stays visible either way */
+#panel.collapsed {
+  transform: translateX(calc(-100% - 24px));
+  opacity: 0; pointer-events: none;
+}
+#panelToggle, #panelClose {
+  font: inherit; cursor: pointer; color: #cfe6f5;
+  background: var(--panel-bg); border: 1px solid var(--panel-border);
+  border-radius: 10px; line-height: 1;
+}
+#panelToggle {
+  position: fixed; top: 14px; left: 14px; z-index: 12;
+  width: 38px; height: 38px; font-size: 19px;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+}
+#panelToggle:hover, #panelClose:hover { color: #fff; border-color: var(--accent); }
+#panelClose {
+  position: absolute; top: 8px; right: 8px; z-index: 2;
+  width: 26px; height: 26px; font-size: 15px; border-radius: 8px;
+}
+/* the open panel shifts below the toggle so both stay reachable */
+#panel:not(.collapsed) { top: 60px; transition: transform 0.28s ease, opacity 0.28s ease, top 0.28s ease; }
 #panel h2 {
   font-size: 11px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
   color: var(--accent); margin: 14px 0 8px;
@@ -143,8 +167,17 @@ details.helpfold > summary:hover { color: #a9c1d4; }
 details.helpfold[open] > summary { margin-bottom: 4px; }
 
 /* stats readout */
-#stats {
+/* bottom-right HUD: temperature chart beside the stats block */
+#hudRight {
   position: fixed; right: 18px; bottom: 16px; z-index: 10;
+  display: flex; align-items: flex-end; gap: 10px;
+}
+#tempChart {
+  background: var(--panel-bg); border: 1px solid var(--panel-border);
+  border-radius: 12px; padding: 6px;
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}
+#stats {
   display: grid; grid-template-columns: auto auto; gap: 3px 14px;
   background: var(--panel-bg); border: 1px solid var(--panel-border);
   border-radius: 12px; padding: 10px 14px;

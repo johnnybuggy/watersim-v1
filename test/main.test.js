@@ -7,10 +7,28 @@ const Q = require('../js/quality.js');
 let clock = 0, queue = [], stepCalls = 0, surfaceCalls = 0, particleCalls = 0;
 const elements = {}, winListeners = {};
 const html = fs.readFileSync(require.resolve('../index.html'), 'utf8');
+const chartCalls = { fillRect: 0, fillText: 0, clearRect: 0, strokes: 0 };
+const chartCtx = new Proxy({}, {
+  get(_, prop) {
+    if (prop === 'fillStyle' || prop === 'strokeStyle' || prop === 'font') return 'x';
+    if (prop === 'fillRect') return (x, y, w, h) => { if (w > 0 && h > 0) chartCalls.fillRect++; };
+    if (prop === 'fillText') return () => chartCalls.fillText++;
+    if (prop === 'clearRect') return () => chartCalls.clearRect++;
+    if (prop === 'beginPath') return () => {};
+    if (prop === 'moveTo' || prop === 'lineTo') return () => {};
+    if (prop === 'stroke') return () => chartCalls.strokes++;
+    return () => {};
+  },
+  set() { return true; }
+});
 for (const [, id] of html.matchAll(/id="([^"]+)"/g)) {
   elements[id] = { value: id === 'selRes' ? 'auto50' : '0', style: {}, checked: true, textContent: '',
-    handlers: {}, classList: { toggle() {} }, addEventListener(type, fn) { this.handlers[type] = fn; },
+    width: 238, height: 126, hidden: false,
+    handlers: {}, classList: { toggle() {}, add() {}, remove() {} },
+    addEventListener(type, fn) { this.handlers[type] = fn; },
+    setAttribute() {}, getAttribute() { return null; },
     click() { if (this.handlers.click) this.handlers.click.call(this); } };
+  if (id === 'tempChart') elements[id].getContext = () => chartCtx;
 }
 class Vector3 {
   constructor(x = 0, y = 0, z = 0) { this.set(x, y, z); }
@@ -20,7 +38,9 @@ class Vector3 {
 class Solver {
   constructor(o) { Object.assign(this, o); this.W = this.H = this.D = o.nx * o.dx;
     this.cx = this.cy = this.cz = this.W / 2; this.balls = []; this.nP = 10;
-    this.pT = new Float32Array(10); this.dens = []; this.umax = 0; this.dtLast = 0.01; this.airborneCount = 0; }
+    this.pT = new Float32Array([0.05, 0.12, 0.2, 0.32, 0.45, 0.58, 0.7, 0.85, 1.0, 1.1]);
+    this.pflag = new Int8Array(10); this.pflag[2] = 2; this.pflag[7] = 2;
+    this.dens = []; this.umax = 0; this.dtLast = 0.01; this.airborneCount = 0; }
   resetWater(d) { this.oceanR = this.coreR + d; this.iso = 1.8; this.terrain = {}; }
   step() { clock += this.nx / 3; stepCalls++; }
   waveImpulse() {} splatDensity() { clock += 1; surfaceCalls++; }
@@ -33,7 +53,7 @@ class Scene {
   setWaterOpacity() {} setParticlesOpacity() {} setSun() {} updateWater() {} updateParticles() { particleCalls++; }
   syncBalls() {} showHandle() {} render() { clock += 1; }
   updatePlanetMotion() {} setYearPeriod() {} setSpinPeriod() {} planetToLocal(out) { return out; }
-  setTilt() {} setBeadsMode() {}
+  setTilt() {} setBeadsMode() {} setMotionBlur() {} setStars() {}
   updateVectors() {} updateLightning() {} setVectorsEnabled() {}
 }
 const context = { document: { hidden: false, getElementById: id => elements[id], addEventListener() {} },
@@ -54,6 +74,9 @@ assert.equal(context.window.waterSimPerformance.level, 'low', '50fps chooses hig
 assert.equal(context.window.waterSimPerformance.measuredBudgetFPS, 60, '50fps budgets for 60Hz presentation');
 assert.equal(elements.panel.inert, false, 'calibration unlocks controls');
 assert.equal(context.window.waterSimPerformance.samples.length, 5, 'calibration stops after first failing tier');
+for (let i = 0; i < 80; i++) tick();   // regular frames → 0.3 s stats tick → chart
+assert.ok(chartCalls.fillRect > 4, 'temperature chart draws histogram bars');
+assert.ok(chartCalls.fillText >= 8, 'temperature chart draws legend + axis labels');
 context.window.waterSimPerformance = null;
 elements.selRes.value = 'auto25'; elements.selRes.handlers.change();
 calibrated();

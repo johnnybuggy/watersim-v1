@@ -23,8 +23,28 @@ const chrome = spawn(chromePath, ['--headless=new', '--no-first-run', '--no-defa
   { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'] });
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 let session = null;   // page session id once attached
-const watchdog = setTimeout(() => { console.error('Browser test timed out'); chrome.kill(); process.exit(1); }, 300000);
+// Shutdown hygiene: this test owns ONLY the Chrome child it spawned (private
+// temp profile + pipe transport — it never touches a browser the user is
+// running). Terminate politely first, hard-kill only if the child lingers,
+// and forward interrupt signals so Ctrl-C cannot orphan the headless browser.
+function stopChrome() {
+  if (chrome.exitCode !== null || chrome.signalCode) return;   // already gone
+  chrome.kill();                                   // SIGTERM
+  setTimeout(() => { try { chrome.kill('SIGKILL'); } catch (_) {} }, 3000);
+}
+function exitAfterChild() {
+  chrome.once('exit', () => process.exit(process.exitCode || 1));
+  setTimeout(() => process.exit(process.exitCode || 1), 4000).unref();
+}
+const watchdog = setTimeout(() => {
+  console.error('Browser test timed out');
+  stopChrome();
+  exitAfterChild();
+}, 300000);
 chrome.on('error', error => { console.error('Chrome launch error', error); process.exitCode = 1; });
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => { stopChrome(); exitAfterChild(); });
+}
 (async () => {
   console.log('Starting Chrome WebGL validation…');
 
@@ -109,7 +129,8 @@ chrome.on('error', error => { console.error('Chrome launch error', error); proce
   } catch (e) {
     console.error('SKIP: Chrome CDP session transport unavailable (' + e.message + ').');
     console.error('The multithreaded-solver integration is covered headlessly by test/main.test.js and test/mt.test.js.');
-    process.exit(0);
+    process.exitCode = 0;   // .finally() still runs → our Chrome child is stopped
+    return;
   }
   await send('Page.navigate', { url: pathToFileURL(path.resolve(__dirname, '../index.html')).href });
   await delay(500);
@@ -120,7 +141,7 @@ chrome.on('error', error => { console.error('Chrome launch error', error); proce
     if(document.getElementById('loading').style.display==='none' && window.waterSimStats) return resolve(true);
     if(performance.now()-start>180000) return reject(new Error('Boot timeout')); requestAnimationFrame(tick); } tick(); })`);
   await waitBoot();
-  console.log('Boot complete (manual Medium 40³ default, GPU solver off)');
+  console.log('Boot complete (manual Medium 40³ default)');
   await evaluate(`document.getElementById('selRes').value='auto50';document.getElementById('selRes').dispatchEvent(new Event('change'));`);
   const waitCalibration = () => evaluate(`new Promise((resolve,reject)=>{const start=performance.now(); function tick(){
     if(window.waterSimPerformance && document.getElementById('loading').style.display==='none') return resolve(window.waterSimPerformance);
@@ -157,5 +178,5 @@ chrome.on('error', error => { console.error('Chrome launch error', error); proce
     // Only remove the mkdtemp-owned test profile, never a normal Chrome profile.
     try { fs.rmSync(profile, { recursive: true, force: true }); } catch (_) {}
   });
-  chrome.kill();
+  stopChrome();
 });

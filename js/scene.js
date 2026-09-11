@@ -85,6 +85,44 @@ function makeCloudTexture() {
   return new THREE.CanvasTexture(c);
 }
 
+// ---------------------------------------------------- particle sprite atlas
+// All five particle sprites live in ONE 3×2 tile atlas so a single Points
+// draw call can render every airborne class (liquid beads, glossy spray,
+// vapor cloudlets, cloud puffs, snow). Tile ids match the CLS_* constants.
+var ATLAS_COLS = 3, ATLAS_ROWS = 2, ATLAS_TILE = 64;
+function makeParticleAtlas() {
+  var tiles = [
+    makeSpriteTexture(),      // 0 flat disc (liquid body, beads mode)
+    makeBeadTexture(),        // 1 glossy droplet (spray / rain)
+    makeCloudTexture(),       // 2 vapor cloudlet
+    makeCloudPuffTexture(),   // 3 cloud puff
+    makeSnowTexture()         // 4 snow grain
+  ];
+  var c = document.createElement('canvas');
+  c.width = ATLAS_COLS * ATLAS_TILE; c.height = ATLAS_ROWS * ATLAS_TILE;
+  var g = c.getContext('2d');
+  var painted = false;
+  for (var i = 0; i < tiles.length; i++) {
+    var tx = (i % ATLAS_COLS) * ATLAS_TILE, ty = ((i / ATLAS_COLS) | 0) * ATLAS_TILE;
+    if (g.drawImage) { g.drawImage(tiles[i].image, tx, ty); painted = true; }
+  }
+  if (!painted) {
+    // headless canvas stub: single-sprite fallback (same flipY contract as
+    // the atlas so tests assert one consistent sampling orientation)
+    tiles[0].flipY = false;
+    return tiles[0];
+  }
+  var tex = new THREE.CanvasTexture(c);
+  // CanvasTexture defaults to flipY=true, which mirrors the upload — the
+  // aSprite → atlas-cell mapping in the shader (uv.y = (row + pc)/rows) then
+  // samples the MIRRORED cell (snow got the glossy bead, vapor the empty
+  // cell). Keep the canvas row-major layout intact.
+  tex.flipY = false;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
 function makeSunTexture() {
   // glowing sun billboard: hot core, warm falloff
   var c = document.createElement('canvas');
@@ -159,99 +197,50 @@ function recolorTerrainMesh(mesh, colorHex) {
   colA.needsUpdate = true;
 }
 
+// Build the terrain surface as a marching-tetrahedra isosurface of the
+// solver's radius field: field[c] = R(c) − |c − centre| (positive inside the
+// rock). The contoured surface IS the physics surface (terrainRadiusAt), so
+// the drawn slopes match every collision query exactly — no voxel steps, and
+// the Laplacian-smoothed field gives smooth rolling slopes. Per-vertex
+// palette identical to the old voxel mesh (beach/green/rock/snow bands).
 function buildVoxelTerrainMesh(terrain, colorHex) {
-  var n = terrain.n, dv = terrain.dv, solid = terrain.solid;
+  var n = terrain.n, dv = terrain.dv;
   var Rsl = terrain.Rsl, Rlo = terrain.Rlo, Rhi = terrain.Rhi;
   var baseCol = new THREE.Color(colorHex || '#654321');   // rock hue (picker)
-  var nn = n + 1;                          // corners per axis
-  var accN = new Float32Array(nn * nn * nn * 3);
-  var accI = new Int32Array(nn * nn * nn).fill(-1);
-  var positions = [], colors = [], indices = [];
-  var nVerts = 0;
-  var normals = null;                      // filled after accumulation (below)
-
-  function corner(ci, cj, ck, fnx, fny, fnz) {
-    var key = ci + cj * nn + ck * nn * nn;
-    var vi = accI[key];
-    if (vi < 0) {
-      vi = nVerts++;
-      accI[key] = vi;
-      positions.push(ci * dv, cj * dv, ck * dv);
-      // surface palette, measured from the planet centre (lattice middle)
-      var ctr = n * dv * 0.5;
-      var rx = ci * dv - ctr, ry = cj * dv - ctr, rz = ck * dv - ctr;
-      var rr = Math.sqrt(rx * rx + ry * ry + rz * rz);
-      var variation = Math.sin(rx * 3.1 + rz * 1.8) * Math.sin(ry * 4.3 - rz * 2.1);
-      var sh = terrainShade(rr, Rsl, Rhi - Rsl, baseCol, _TERR_OUT, ry / (rr || 1), variation);
-      var spk = 0.94 + 0.06 * variation;
-      colors.push(Math.min(sh.r * spk, 1), Math.min(sh.g * spk, 1), Math.min(sh.b * spk, 1));
-    }
-    accN[key * 3] += fnx; accN[key * 3 + 1] += fny; accN[key * 3 + 2] += fnz;
-    return vi;
-  }
-  function quad(a, b, c, d, fnx, fny, fnz) {   // CCW corners, outward normal
-    var va = corner(a[0], a[1], a[2], fnx, fny, fnz);
-    var vb = corner(b[0], b[1], b[2], fnx, fny, fnz);
-    var vc = corner(c[0], c[1], c[2], fnx, fny, fnz);
-    var vd = corner(d[0], d[1], d[2], fnx, fny, fnz);
-    indices.push(va, vb, vc, va, vc, vd);
-  }
-
-  for (var k = 0; k < n; k++) {
-    for (var j = 0; j < n; j++) {
-      var rowB = (k * n + j) * n;
-      for (var i = 0; i < n; i++) {
-        if (!solid[rowB + i]) continue;
-        // 6 neighbours; emit a face wherever the rock meets air/space
-        if (i === 0 || !solid[rowB + i - 1])
-          quad([i, j, k], [i, j, k + 1], [i, j + 1, k + 1], [i, j + 1, k], -1, 0, 0);
-        if (i === n - 1 || !solid[rowB + i + 1])
-          quad([i + 1, j, k], [i + 1, j + 1, k], [i + 1, j + 1, k + 1], [i + 1, j, k + 1], 1, 0, 0);
-        if (j === 0 || !solid[rowB + i - n])
-          quad([i, j, k], [i + 1, j, k], [i + 1, j, k + 1], [i, j, k + 1], 0, -1, 0);
-        if (j === n - 1 || !solid[rowB + i + n])
-          quad([i, j + 1, k], [i, j + 1, k + 1], [i + 1, j + 1, k + 1], [i + 1, j + 1, k], 0, 1, 0);
-        if (k === 0 || !solid[rowB + i - n * n])
-          quad([i, j, k], [i, j + 1, k], [i + 1, j + 1, k], [i + 1, j, k], 0, 0, -1);
-        if (k === n - 1 || !solid[rowB + i + n * n])
-          quad([i, j, k + 1], [i + 1, j, k + 1], [i + 1, j + 1, k + 1], [i, j + 1, k + 1], 0, 0, 1);
-      }
-    }
-  }
-  // copy accumulated corner normals into vertex order: accN is keyed by
-  // corner position, vertices were numbered in creation order — mixing the
-  // two left most vertices with zero normals (the planet rendered black)
-  normals = new Float32Array(nVerts * 3);
-  var nKeys = nn * nn * nn;
-  for (var ck2 = 0; ck2 < nKeys; ck2++) {
-    var vi2 = accI[ck2];
-    if (vi2 < 0) continue;
-    var nx0 = accN[ck2 * 3], ny0 = accN[ck2 * 3 + 1], nz0 = accN[ck2 * 3 + 2];
-    var nl = Math.sqrt(nx0 * nx0 + ny0 * ny0 + nz0 * nz0);
-    if (nl < 0.5) {
-      // degenerate corner (opposing faces cancel): fall back to the radial
-      // direction so the vertex still catches light instead of rendering black
-      var ex2 = positions[vi2 * 3] - nn * dv * 0.5,
-          ey2 = positions[vi2 * 3 + 1] - nn * dv * 0.5,
-          ez2 = positions[vi2 * 3 + 2] - nn * dv * 0.5;
-      nl = Math.sqrt(ex2 * ex2 + ey2 * ey2 + ez2 * ez2) || 1;
-      normals[vi2 * 3] = ex2 / nl; normals[vi2 * 3 + 1] = ey2 / nl; normals[vi2 * 3 + 2] = ez2 / nl;
-    } else {
-      normals[vi2 * 3] = nx0 / nl; normals[vi2 * 3 + 1] = ny0 / nl; normals[vi2 * 3 + 2] = nz0 / nl;
-    }
-  }
+  var field = terrain.field;
+  // contour the field (corner lattice — the same convention the water
+  // surface uses for its density grid); resolve the mesher via the module
+  // global (window/globalThis) like every other cross-file reference
+  var MT = global.MarchingTetrahedra || (typeof MarchingTetrahedra !== 'undefined' ? MarchingTetrahedra : null);
+  if (!MT || !field) return null;          // headless stub or missing field
+  var m = MT.build(field, n, n, n, dv, 0);
+  var vcount = m.count;
   var geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
-  geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
-  geo.setIndex(indices);
+  var ctr = n * dv * 0.5;
+  var spanHi = Math.max(Rhi - Rsl, 0.02);
+  var colA = new Float32Array(vcount * 3);
+  for (var v = 0; v < vcount; v++) {
+    var rx = m.pos[v * 3] - ctr, ry = m.pos[v * 3 + 1] - ctr, rz = m.pos[v * 3 + 2] - ctr;
+    var rr = Math.sqrt(rx * rx + ry * ry + rz * rz);
+    var variation = Math.sin(rx * 3.1 + rz * 1.8) * Math.sin(ry * 4.3 - rz * 2.1);
+    var sh = terrainShade(rr, Rsl, spanHi, baseCol, _TERR_OUT, ry / (rr || 1), variation);
+    var spk = 0.94 + 0.06 * variation;
+    colA[v * 3] = Math.min(sh.r * spk, 1);
+    colA[v * 3 + 1] = Math.min(sh.g * spk, 1);
+    colA[v * 3 + 2] = Math.min(sh.b * spk, 1);
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(m.pos.subarray(0, vcount * 3)), 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(m.nrm.subarray(0, vcount * 3)), 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colA, 3));
   var mat = new THREE.MeshPhongMaterial({
     color: 0xffffff,                    // vertex colors carry the full palette
     vertexColors: true,
     shininess: 8,                       // matte soil and weathered stone
     specular: 0x0b1010
   });
-  return new THREE.Mesh(geo, mat);
+  var mesh = new THREE.Mesh(geo, mat);
+  mesh.userData.vcount = vcount;
+  return mesh;
 }
 
 function makeSky() {
@@ -280,6 +269,51 @@ function makeSky() {
   var m = new THREE.Mesh(geo, mat);
   m.frustumCulled = false;
   return m;
+}
+
+function makeCloudPuffTexture() {
+  // cloud droplet: light grey, ALMOST solid — soft rim only
+  var c = document.createElement('canvas');
+  c.width = c.height = 64;
+  var g = c.getContext('2d');
+  var grd = g.createRadialGradient(32, 32, 4, 32, 32, 31);
+  grd.addColorStop(0.0, 'rgba(226,229,236,1)');
+  grd.addColorStop(0.7, 'rgba(210,214,224,0.96)');
+  grd.addColorStop(0.92, 'rgba(196,202,214,0.55)');
+  grd.addColorStop(1.0, 'rgba(190,198,212,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+
+function makeSnowTexture() {
+  // snow grain: solid white disc, slight radial transparency along the edge
+  var c = document.createElement('canvas');
+  c.width = c.height = 64;
+  var g = c.getContext('2d');
+  var grd = g.createRadialGradient(32, 32, 0, 32, 32, 31);
+  grd.addColorStop(0.0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.78, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.93, 'rgba(255,255,255,0.72)');
+  grd.addColorStop(1.0, 'rgba(255,255,255,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+
+function makeStarTexture() {
+  // soft round star sprite for the bright layer (additive glow falloff)
+  var c = document.createElement('canvas');
+  c.width = c.height = 64;
+  var g = c.getContext('2d');
+  var grd = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grd.addColorStop(0.0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.25, 'rgba(255,255,255,0.55)');
+  grd.addColorStop(0.6, 'rgba(210,225,255,0.14)');
+  grd.addColorStop(1.0, 'rgba(200,220,255,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
 }
 
 // --------------------------------------------------------------------- scene
@@ -374,25 +408,52 @@ function WaterScene(container, W, H, D, opts) {
   scene.add(this.sunSprite);
   this.sunPos = new THREE.Vector3(W * 3, H * 2, D);
 
-  // starfield (fits both the dusk pool and the ocean planet)
-  (function () {
-    var n = 1100, pos = new Float32Array(n * 3);
-    for (var i = 0; i < n; i++) {
-      var th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
-      var rr = 52 + Math.random() * 12;
-      pos[i * 3] = rr * Math.sin(ph) * Math.cos(th);
-      pos[i * 3 + 1] = rr * Math.cos(ph);
-      pos[i * 3 + 2] = rr * Math.sin(ph) * Math.sin(th);
+  // starfield: three layers (fine dust, mid stars, a few bright glows) with
+  // per-star color temperature — sits inside the sky dome (r=70) and is
+  // rescaled with the world so giant planets keep their sky
+  this._starGroup = new THREE.Group();
+  this._starLayers = [];
+  (function (self, brightTex) {
+    // star temperature palette (weighted): white / blue-white / warm / amber
+    var palette = [
+      [1, 1, 1], [1, 1, 1], [1, 1, 1],            // white — 43%
+      [0.80, 0.88, 1], [0.80, 0.88, 1],           // blue-white — 29%
+      [1, 0.92, 0.78],                            // warm — 14%
+      [1, 0.82, 0.62]                             // amber — 14%
+    ];
+    function makeLayer(n, size, opacity, additive, useTex) {
+      var pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+      for (var i = 0; i < n; i++) {
+        var th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+        var rr = 52 + Math.random() * 12;
+        pos[i * 3] = rr * Math.sin(ph) * Math.cos(th);
+        pos[i * 3 + 1] = rr * Math.cos(ph);
+        pos[i * 3 + 2] = rr * Math.sin(ph) * Math.sin(th);
+        var c = palette[(Math.random() * palette.length) | 0];
+        var b = 0.7 + Math.random() * 0.3;   // per-star luminance spread (bright floor)
+        col[i * 3] = c[0] * b; col[i * 3 + 1] = c[1] * b; col[i * 3 + 2] = c[2] * b;
+      }
+      var geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      var mat = new THREE.PointsMaterial({
+        size: size, sizeAttenuation: true, vertexColors: true,
+        transparent: true, opacity: opacity, depthWrite: false,
+        blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending
+      });
+      if (useTex) mat.map = brightTex;
+      var pts = new THREE.Points(geo, mat);
+      pts.frustumCulled = false;
+      self._starGroup.add(pts);
+      self._starLayers.push({ mat: mat, base: opacity,
+        phase: Math.random() * Math.PI * 2, speed: 0.3 + Math.random() * 0.9, tw: 0.12 });
     }
-    var geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    var stars = new THREE.Points(geo, new THREE.PointsMaterial({
-      color: 0xdfe9ff, size: 0.16, sizeAttenuation: true,
-      transparent: true, opacity: 0.425, depthWrite: false   // 50% darker space
-    }));
-    scene.add(stars);
-    this._stars = stars;   // rescaled with the world so giant planets keep their sky
-  }.bind(this))();
+    makeLayer(2200, 0.22, 0.75, false, false);  // dust field — denser, brighter
+    makeLayer(420, 0.38, 0.95, false, false);   // mid field
+    makeLayer(120, 0.8, 1.0, true, true);       // bright glows (additive sprite)
+  })(this, makeStarTexture());
+  scene.add(this._starGroup);
+  this._starBrightness = 1.25;   // prominent default (slider 0–2)
 
   // world structure (rebuildable — pool deck or ocean planet)
   this._poolMeshes = [];
@@ -448,65 +509,93 @@ function WaterScene(container, W, H, D, opts) {
   this.planetGroup.add(this.waterMesh);
   this.waterMesh.visible = !this.beadsMode;   // beads mode hides the surface
 
-  // ---------------- spray particles (soft round sprites)
-  this.pGeo = new THREE.BufferGeometry();
-  this.pPos = new Float32Array(9);
-  this.pCol = new Float32Array(9);
-  this.pGeo.setAttribute('position', new THREE.BufferAttribute(this.pPos, 3).setUsage(THREE.DynamicDrawUsage));
-  this.pGeo.setAttribute('color', new THREE.BufferAttribute(this.pCol, 3).setUsage(THREE.DynamicDrawUsage));
-  this.pSprite = makeSpriteTexture();
-  this.beadSprite = makeBeadTexture();
-  this.beadsMode = false;              // water as droplet particles, no surface mesh
-  // Rain / spray droplets (detached airborne water): GLOSSY sprite droplets —
-  // the sphere-shaded specular texture — drawn 3× smaller than the liquid
-  // droplets. Transparency follows the spray & atmosphere opacity slider.
-  this.pMat = new THREE.PointsMaterial({
-    size: 0.06, vertexColors: true, map: this.beadSprite, color: 0xffffff,
-    transparent: true, opacity: 0.85, depthWrite: false, sizeAttenuation: true
+  // ---------------- particles: ONE combined, camera-sorted Points system ----
+  // Every airborne class (liquid beads, glossy spray, vapor, cloud, snow)
+  // shares a single draw call with a per-particle sprite tile, size and
+  // alpha. Each frame the particle list is bucket-sorted by squared distance
+  // from the camera (far → near, O(n) counting sort) so a far vapor cloudlet
+  // or cloud puff can never paint over a nearer water bead or snow grain —
+  // particles only ever composite front-to-back correctly, in every order.
+  // depthTest stays on (terrain still occludes the far side); depthWrite
+  // stays off (no particle hides another through depth).
+  this.allGeo = new THREE.BufferGeometry();
+  this.allPos = new Float32Array(27);
+  this.allCol = new Float32Array(27);
+  this.allAlpha = new Float32Array(9);
+  this.allSize = new Float32Array(9);
+  this.allSprite = new Float32Array(9);
+  this.allGeo.setAttribute('position', new THREE.BufferAttribute(this.allPos, 3).setUsage(THREE.DynamicDrawUsage));
+  this.allGeo.setAttribute('aCol', new THREE.BufferAttribute(this.allCol, 3).setUsage(THREE.DynamicDrawUsage));
+  this.allGeo.setAttribute('aAlpha', new THREE.BufferAttribute(this.allAlpha, 1).setUsage(THREE.DynamicDrawUsage));
+  this.allGeo.setAttribute('aSize', new THREE.BufferAttribute(this.allSize, 1).setUsage(THREE.DynamicDrawUsage));
+  this.allGeo.setAttribute('aSprite', new THREE.BufferAttribute(this.allSprite, 1).setUsage(THREE.DynamicDrawUsage));
+  this.atlasTex = makeParticleAtlas();
+  this.allMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uAtlas: { value: this.atlasTex },
+      uTiles: { value: new THREE.Vector2(ATLAS_COLS, ATLAS_ROWS) },
+      uPointScale: { value: 300 }
+    },
+    vertexShader: [
+      'attribute vec3 aCol;',
+      'attribute float aAlpha;',
+      'attribute float aSize;',
+      'attribute float aSprite;',
+      'uniform float uPointScale;',
+      'varying vec3 vCol;',
+      'varying float vA;',
+      'varying float vT;',
+      'void main() {',
+      '  vCol = aCol; vA = aAlpha; vT = aSprite;',
+      '  vec4 mv = modelViewMatrix * vec4(position, 1.0);',
+      '  gl_PointSize = aSize * (uPointScale / max(0.15, -mv.z));',
+      '  gl_Position = projectionMatrix * mv;',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform sampler2D uAtlas;',
+      'uniform vec2 uTiles;',
+      'varying vec3 vCol;',
+      'varying float vA;',
+      'varying float vT;',
+      'void main() {',
+      '  float tile = floor(vT + 0.5);',
+      '  float tx = mod(tile, uTiles.x);',
+      '  float ty = floor(tile / uTiles.x);',
+      '  vec2 uv = (vec2(tx, ty) + clamp(gl_PointCoord, 0.03, 0.97)) / uTiles;',
+      '  vec4 tex = texture2D(uAtlas, uv);',
+      '  float a = tex.a * vA;',
+      '  if (a < 0.02) discard;',
+      '  gl_FragColor = vec4(vCol * tex.rgb, a);',
+      '}'
+    ].join('\n'),
+    transparent: true,
+    depthWrite: false,
+    depthTest: true
   });
-
-  // ---------------- liquid body (beads mode): flat blue circles
-  // The water body as flat, evenly transparent discs — the hard-edged uniform
-  // circle sprite, no gradients — tinted per particle with the water color
-  // and darkened by the solver's sun exposure, so the night side renders
-  // dark while the day side is flat bright blue. Transparency follows the
-  // WATER-SURFACE opacity slider (the circles ARE the surface in this mode).
-  this.beadsGeo = new THREE.BufferGeometry();
-  this.bPos = new Float32Array(9);
-  this.bCol = new Float32Array(9);
-  this.beadsGeo.setAttribute('position', new THREE.BufferAttribute(this.bPos, 3).setUsage(THREE.DynamicDrawUsage));
-  this.beadsGeo.setAttribute('color', new THREE.BufferAttribute(this.bCol, 3).setUsage(THREE.DynamicDrawUsage));
-  this.beadMat = new THREE.PointsMaterial({
-    size: 0.2, vertexColors: true, map: this.pSprite, color: 0xffffff,
-    transparent: true, opacity: 0.25, depthWrite: false, sizeAttenuation: true
-  });
-
-  // ---------------- evaporated vapor: broad, soft low-opacity cloudlets
-  this.vGeo = new THREE.BufferGeometry();
-  this.vPos = new Float32Array(9);
-  this.vCol = new Float32Array(9);
-  this.vGeo.setAttribute('position', new THREE.BufferAttribute(this.vPos, 3).setUsage(THREE.DynamicDrawUsage));
-  this.vGeo.setAttribute('color', new THREE.BufferAttribute(this.vCol, 3).setUsage(THREE.DynamicDrawUsage));
-  this.cloudSprite = makeCloudTexture();
-  this.vMat = new THREE.PointsMaterial({
-    size: 0.26, vertexColors: true, map: this.cloudSprite, color: 0xffffff,
-    transparent: true, opacity: 0.23, depthWrite: false, sizeAttenuation: true
-  });
-  this.vapor = new THREE.Points(this.vGeo, this.vMat);
-  this.vapor.frustumCulled = false;
-  this.vapor.renderOrder = 5;
-  this.planetGroup.add(this.vapor);
+  this.allPts = new THREE.Points(this.allGeo, this.allMat);
+  this.allPts.frustumCulled = false;
+  this.allPts.renderOrder = 2;         // under the water surface film (4)
+  this.allPts.visible = false;         // draw range set by updateParticles
+  this.planetGroup.add(this.allPts);
+  // per-class staging (same names the sorting pass reads back)
+  this.pPos = new Float32Array(27); this.pCol = new Float32Array(27);   // spray/rain
+  this.vPos = new Float32Array(27); this.vCol = new Float32Array(27);   // vapor
+  this.cPos = new Float32Array(27); this.cCol = new Float32Array(27);   // cloud
+  this.sPos = new Float32Array(27); this.sCol = new Float32Array(27);   // snow
+  this.bPos = new Float32Array(27); this.bCol = new Float32Array(27);   // liquid beads
+  this._classCounts = { beads: 0, spray: 0, vapor: 0, cloud: 0, snow: 0 };
+  // sort scratch (allocation-free, sized in _ensureParticles)
+  this._d2 = new Float32Array(9);
+  this._ord = new Uint32Array(9);
+  this._bkt = new Int32Array(65);
+  this._hist = new Int32Array(64);
+  this._camLocal = new THREE.Vector3(0, 0, 0);
+  this._invPlanet = new THREE.Matrix4();
+  this._tmpV3 = new THREE.Vector3();
   this.pOpa = 1;                       // user transparency multiplier (spray/vapor)
   this.waterOpa = 0.25;                // water-surface opacity (drives liquid beads)
-  this.points = new THREE.Points(this.pGeo, this.pMat);
-  this.points.frustumCulled = false;
-  this.points.renderOrder = 2;
-  this.planetGroup.add(this.points);
-  this.beadsPoints = new THREE.Points(this.beadsGeo, this.beadMat);
-  this.beadsPoints.frustumCulled = false;
-  this.beadsPoints.renderOrder = 1;    // the liquid body composites UNDER spray
-  this.beadsPoints.visible = false;    // beads mode only
-  this.planetGroup.add(this.beadsPoints);
+  this.beadsMode = false;              // water as droplet particles, no surface mesh
 
   // ---------------- balls
   this.ballGroup = new THREE.Group();
@@ -529,9 +618,12 @@ function WaterScene(container, W, H, D, opts) {
   // the simulation.
   this._BOLT_PTS = 9;                  // points along one bolt channel
   this._flashes = [];
+  // soft radial glow texture for the flash (a SpriteMaterial without a map
+  // renders as an untextured white square — always give it the gradient)
+  var flashTex = makeCloudTexture();
   for (var li = 0; li < 10; li++) {
     var lSprite = new THREE.Sprite(new THREE.SpriteMaterial({
-      map: this.cloudSprite, color: 0xdcecff, transparent: true, opacity: 0,
+      map: flashTex, color: 0xdcecff, transparent: true, opacity: 0,
       depthWrite: false, blending: THREE.AdditiveBlending
     }));
     lSprite.visible = false;
@@ -789,7 +881,7 @@ WaterScene.prototype._buildSphere = function (W, H, D, opts) {
   this.camera.far = Math.max(220, 130 * wScale);
   this.camera.updateProjectionMatrix();
   if (this._sky) this._sky.scale.setScalar(Math.max(1, wScale));
-  if (this._stars) this._stars.scale.setScalar(Math.max(1, wScale));
+  if (this._starGroup) this._starGroup.scale.setScalar(Math.max(1, wScale));
   if (this.handle) this.handle.scale.setScalar(Math.max(0.05, wScale));
 
   if (this.orbit) {
@@ -839,6 +931,7 @@ WaterScene.prototype.buildTerrain = function (terrain, colorHex) {
     }
   }
   var mesh = buildVoxelTerrainMesh(terrain, this.planetColor || '#654321');
+  if (!mesh) return;                       // headless stub: keep the placeholder core
   mesh.userData.terrain = terrain;
   mesh.castShadow = true;
   mesh.receiveShadow = true;
@@ -897,27 +990,33 @@ WaterScene.prototype.setWaterOpacity = function (o) {
   this.waterOpa = o;
   this.waterMat.opacity = o;
   // In beads mode the liquid body IS the water surface — the flat blue
-  // circles inherit this slider instead of the spray/atmosphere opacity.
-  if (this.beadMat) {
-    this.beadMat.opacity = Math.min(1, Math.max(0, o));
-  }
+  // circles inherit this slider instead of the spray/atmosphere opacity
+  // (baked per particle by the next updateParticles call).
 };
 
 // ------------------------------------------------------------------ particles
 WaterScene.prototype._ensureParticles = function (n) {
   if (this.pPos.length >= n * 3) return;
-  this.pPos = new Float32Array(n * 3);
-  this.pCol = new Float32Array(n * 3);
-  this.pGeo.setAttribute('position', new THREE.BufferAttribute(this.pPos, 3).setUsage(THREE.DynamicDrawUsage));
-  this.pGeo.setAttribute('color', new THREE.BufferAttribute(this.pCol, 3).setUsage(THREE.DynamicDrawUsage));
-  this.bPos = new Float32Array(n * 3);
-  this.bCol = new Float32Array(n * 3);
-  this.beadsGeo.setAttribute('position', new THREE.BufferAttribute(this.bPos, 3).setUsage(THREE.DynamicDrawUsage));
-  this.beadsGeo.setAttribute('color', new THREE.BufferAttribute(this.bCol, 3).setUsage(THREE.DynamicDrawUsage));
-  this.vPos = new Float32Array(n * 3);
-  this.vCol = new Float32Array(n * 3);
-  this.vGeo.setAttribute('position', new THREE.BufferAttribute(this.vPos, 3).setUsage(THREE.DynamicDrawUsage));
-  this.vGeo.setAttribute('color', new THREE.BufferAttribute(this.vCol, 3).setUsage(THREE.DynamicDrawUsage));
+  // per-class staging
+  this.pPos = new Float32Array(n * 3); this.pCol = new Float32Array(n * 3);
+  this.bPos = new Float32Array(n * 3); this.bCol = new Float32Array(n * 3);
+  this.vPos = new Float32Array(n * 3); this.vCol = new Float32Array(n * 3);
+  this.cPos = new Float32Array(n * 3); this.cCol = new Float32Array(n * 3);
+  this.sPos = new Float32Array(n * 3); this.sCol = new Float32Array(n * 3);
+  // combined sorted attributes
+  this.allPos = new Float32Array(n * 3);
+  this.allCol = new Float32Array(n * 3);
+  this.allAlpha = new Float32Array(n);
+  this.allSize = new Float32Array(n);
+  this.allSprite = new Float32Array(n);
+  this.allGeo.setAttribute('position', new THREE.BufferAttribute(this.allPos, 3).setUsage(THREE.DynamicDrawUsage));
+  this.allGeo.setAttribute('aCol', new THREE.BufferAttribute(this.allCol, 3).setUsage(THREE.DynamicDrawUsage));
+  this.allGeo.setAttribute('aAlpha', new THREE.BufferAttribute(this.allAlpha, 1).setUsage(THREE.DynamicDrawUsage));
+  this.allGeo.setAttribute('aSize', new THREE.BufferAttribute(this.allSize, 1).setUsage(THREE.DynamicDrawUsage));
+  this.allGeo.setAttribute('aSprite', new THREE.BufferAttribute(this.allSprite, 1).setUsage(THREE.DynamicDrawUsage));
+  // sort scratch
+  this._d2 = new Float32Array(n);
+  this._ord = new Uint32Array(n);
 };
 
 WaterScene.prototype.updateParticles = function (solver, show) {
@@ -926,25 +1025,35 @@ WaterScene.prototype.updateParticles = function (solver, show) {
   // vapor keep answering to the spray/atmosphere opacity slider.
   var showBeads = !!(show && this.beadsMode && this.waterOpa > 0.01);
   var showSpray = !!(show && this.pOpa > 0.01);
-  this.beadsPoints.visible = showBeads;
-  this.points.visible = showSpray;
-  this.vapor.visible = showSpray;
-  if (!showBeads && !showSpray) return;
+  var anyShow = showBeads || showSpray;
+  this.allPts.visible = anyShow;
+  this._classCounts.beads = this._classCounts.spray = this._classCounts.vapor =
+    this._classCounts.cloud = this._classCounts.snow = 0;
+  if (!anyShow) {
+    this.allGeo.setDrawRange(0, 0);
+    return;
+  }
   var n = solver.nP;
   this._ensureParticles(n);
   var px = solver.px, py = solver.py, pz = solver.pz;
   var fl = solver.pflag;
-  var pos = this.pPos, col = this.pCol, vpos = this.vPos, vcol = this.vCol;
-  var bpos = this.bPos, bcol = this.bCol;
   var T = solver.pT, hasT = T && T.length >= n;
   // per-particle sun exposure computed by the solver's thermal tick (terrain
-  // shade + water-column optical depth + night side). Missing (GPU path or
-  // first frame) → hemispheric fallback.
+  // shade + water-column optical depth + night side). Missing (first frame)
+  // → hemispheric fallback.
   var pLight = solver.pLight, hasLight = pLight && pLight.length >= n;
-  var nW = 0, nV = 0, nB = 0;
+  // per-particle water-overhead count mirrored by the solver's thermal tick:
+  // 0 = at/above the local surface … 4 = deep interior (beads cull)
+  var pDepth = solver.pDepth, hasDepth = pDepth && pDepth.length >= n;
+  // per-class staging + counts
+  var pPos = this.pPos, pCol = this.pCol, bPos = this.bPos, bCol = this.bCol;
+  var vPos = this.vPos, vCol = this.vCol, cPos = this.cPos, cCol = this.cCol;
+  var sPos = this.sPos, sCol = this.sCol;
+  var nW = 0, nV = 0, nB = 0, nC = 0, nS = 0;
   // planet centre (local) + sun direction for the day/night dimming. Particle
   // coordinates live in the solver frame, which spins with the planet, so the
   // sun must be the local-frame direction: the terminator sweeps with the spin.
+  var pPh = solver.pPh, spinCue = !!(solver.spinOn && pPh && pPh.length >= n);
   var pcx = this.W * 0.5, pcy = this.H * 0.5, pcz = this.D * 0.5;
   var sdx = this._sunDirLocal.x, sdy = this._sunDirLocal.y, sdz = this._sunDirLocal.z;
   var sln = 1;
@@ -967,13 +1076,36 @@ WaterScene.prototype.updateParticles = function (solver, show) {
     }
     var br = 0.12 + 0.88 * expo;
     var i3;
+    var sunnyBead = false;   // day-hemisphere liquid bead (draws normal color)
+    if (fl[p] === 3) {
+      if (!showSpray) continue;
+      // cloud droplets: light grey, almost solid — brighter than steam and
+      // rendered from their own near-opaque sprite
+      i3 = nC * 3; nC++;
+      cPos[i3] = px[p]; cPos[i3 + 1] = py[p]; cPos[i3 + 2] = pz[p];
+      var cl = 0.30 + 0.70 * br;
+      if (spinCue) cl *= 0.9 + 0.1 * Math.cos(pPh[p]);
+      cCol[i3] = 0.88 * cl; cCol[i3 + 1] = 0.90 * cl; cCol[i3 + 2] = 0.93 * cl;
+      continue;
+    }
+    if (fl[p] === 5) {
+      if (!showSpray) continue;
+      // snow: solid white disc, slight edge transparency; the exposure only
+      // nudges brightness so snow stays white on the night side
+      i3 = nS * 3; nS++;
+      sPos[i3] = px[p]; sPos[i3 + 1] = py[p]; sPos[i3 + 2] = pz[p];
+      var sw = 0.62 + 0.38 * br;
+      sCol[i3] = sw; sCol[i3 + 1] = sw; sCol[i3 + 2] = sw;
+      continue;
+    }
     if (fl[p] === 2) {
       if (!showSpray) continue;
       // Atmospheric parcels overlap into wisps rather than hard motes.
       i3 = nV * 3; nV++;
-      vpos[i3] = px[p]; vpos[i3 + 1] = py[p]; vpos[i3 + 2] = pz[p];
+      vPos[i3] = px[p]; vPos[i3 + 1] = py[p]; vPos[i3 + 2] = pz[p];
       var cloudLight = 0.22 + 0.78 * br;
-      vcol[i3] = 0.76 * cloudLight; vcol[i3 + 1] = 0.85 * cloudLight; vcol[i3 + 2] = cloudLight;
+      if (spinCue) cloudLight *= 0.85 + 0.15 * Math.cos(pPh[p]);   // spin twinkle
+      vCol[i3] = 0.76 * cloudLight; vCol[i3 + 1] = 0.85 * cloudLight; vCol[i3 + 2] = cloudLight;
       continue;
     }
     if (fl[p] === 0) {
@@ -981,12 +1113,25 @@ WaterScene.prototype.updateParticles = function (solver, show) {
       // EXCEPT in beads mode, where water renders exclusively as flat blue
       // circles whose transparency follows the water-surface opacity slider.
       if (!showBeads) continue;
+      // Sunny-side water is NEVER "interior": on the day hemisphere every
+      // liquid particle draws, with its normal color — the sun lights the
+      // whole column and there is no dark speckle to hide. The depth cull
+      // and the exposure darkening only shape the NIGHT side, where they
+      // form the true planet shadow.
+      var sunny = !this._planetLit;
+      if (!sunny) {
+        var sx0 = px[p] - pcx, sy0 = py[p] - pcy, sz0 = pz[p] - pcz;
+        var sl0 = Math.sqrt(sx0 * sx0 + sy0 * sy0 + sz0 * sz0) || 1e-6;
+        sunny = (sx0 * sdx + sy0 * sdy + sz0 * sdz) / (sl0 * sln) > 0;
+      }
+      if (!sunny && hasDepth && pDepth[p] > 1) continue;
+      sunnyBead = sunny;
       i3 = nB * 3; nB++;
-      bpos[i3] = px[p]; bpos[i3 + 1] = py[p]; bpos[i3 + 2] = pz[p];
+      bPos[i3] = px[p]; bPos[i3 + 1] = py[p]; bPos[i3 + 2] = pz[p];
     } else {
       if (!showSpray) continue;
       i3 = nW * 3; nW++;
-      pos[i3] = px[p]; pos[i3 + 1] = py[p]; pos[i3 + 2] = pz[p];
+      pPos[i3] = px[p]; pPos[i3 + 1] = py[p]; pPos[i3 + 2] = pz[p];
     }
     // Water keeps the selected hue; temperature only subtly changes
     // brightness, never turns the water into orange droplets. Rain is
@@ -997,41 +1142,163 @@ WaterScene.prototype.updateParticles = function (solver, show) {
     var cr = this.waterColor.r * (0.9 + 0.1 * w);
     var cg = this.waterColor.g;
     var cb = this.waterColor.b;
-    if (fl[p] === 1) {   // rain stays bright, but keeps its heat tint
+    if (fl[p] === 1 || fl[p] === 4) {   // rain stays bright, keeps its heat tint
       cr = cr * 0.45 + 0.55; cg = cg * 0.45 + 0.55; cb = cb * 0.45 + 0.55;
     }
-    if (fl[p] === 0) {   // flat circles: hue × exposure shading
-      bcol[i3] = cr * br; bcol[i3 + 1] = cg * br; bcol[i3 + 2] = cb * br;
+    if (fl[p] === 0) {   // flat circles: hue × exposure shading — but a
+      // sunny-side bead keeps its NORMAL color (no exposure darkening)
+      var brr = sunnyBead ? 1 : br;
+      bCol[i3] = cr * brr; bCol[i3 + 1] = cg * brr; bCol[i3 + 2] = cb * brr;
     } else {             // rain + vapor sprites: hue × exposure shading
-      col[i3] = cr * br; col[i3 + 1] = cg * br; col[i3 + 2] = cb * br;
+      pCol[i3] = cr * br; pCol[i3 + 1] = cg * br; pCol[i3 + 2] = cb * br;
     }
   }
-  var geometries = [this.beadsGeo, this.pGeo, this.vGeo], counts = [nB, nW, nV];
-  for (var g = 0; g < 3; g++) {
-    var pa = geometries[g].getAttribute('position'), ca = geometries[g].getAttribute('color');
-    pa.updateRange.offset = ca.updateRange.offset = 0;
-    pa.updateRange.count = ca.updateRange.count = counts[g] * 3;
-    if (counts[g]) { pa.needsUpdate = true; ca.needsUpdate = true; }
-    geometries[g].setDrawRange(0, counts[g]);
-  }
+  this._classCounts.beads = nB; this._classCounts.spray = nW;
+  this._classCounts.vapor = nV; this._classCounts.cloud = nC; this._classCounts.snow = nS;
+  var total = nB + nW + nV + nC + nS;
+  var allPos = this.allPos, allCol = this.allCol, allAlpha = this.allAlpha;
+  var allSize = this.allSize, allSprite = this.allSprite;
+  this.allGeo.setDrawRange(0, total);
+  if (!total) return;
+  // per-class size + alpha (world units; the shader scales by camera distance)
   var spSz = solver.spacing;
-  if (isFinite(spSz) && spSz > 0.02) {
-    this.beadMat.size = spSz * 3.4;                   // water circle diameter
-    this.pMat.size = spSz * 3.4 / 3;                  // glossy rain: 3× smaller
-    // vapor cloudlet size scales with the world (the old absolute 0.18–0.4
-    // clamp shrank cloudlets to invisibility on giant planets)
-    var wS = this._wScale || 1;
-    this.vMat.size = Math.max(0.18 * wS, Math.min(0.4 * wS, solver.spacing * 5));
+  if (!(isFinite(spSz) && spSz > 0.02)) spSz = 0.06;
+  var wS = this._wScale || 1;
+  var beadSz = spSz * 3.4;                       // water circle diameter
+  var spraySz = spSz * 3.4 / 3;                  // glossy rain: 3× smaller
+  var vapSz = Math.max(0.18 * wS, Math.min(0.4 * wS, spSz * 5));
+  var cloudSz = Math.max(0.30 * wS, Math.min(0.62 * wS, spSz * 6.5));
+  var snowSz = spSz * 3.4;                       // snow: same disc size as water
+  var beadA = Math.min(1, Math.max(0, this.waterOpa));
+  var sprayA = Math.min(1, 0.95 * this.pOpa);
+  var vapA = 0.23 * Math.sqrt(this.pOpa);
+  var cloudA = Math.min(1, 0.88 * this.pOpa);
+  var snowA = 1;                                 // ice is opaque: never follows the spray/atmosphere opacity slider
+  // ---- camera-relative depth (planet-local frame) --------------------------
+  // Particles live in the planetGroup's local (solver) frame; the camera is
+  // somewhere else entirely (world). Pull the camera into that frame once,
+  // then bucket-sort every particle far → near so painter order matches
+  // physical depth across ALL classes: nothing farther may paint over a
+  // nearer particle, whatever the class pair.
+  var camL = this._camLocal, sortOn = false;
+  if (this.planetGroup && this.planetGroup.matrixWorld && this.camera &&
+      this.camera.matrixWorld) {
+    this._tmpV3.setFromMatrixPosition(this.camera.matrixWorld);
+    this._invPlanet.copy(this.planetGroup.matrixWorld).invert();
+    camL.copy(this._tmpV3).applyMatrix4(this._invPlanet);
+    sortOn = true;
+  } else {
+    camL.set(pcx, pcy, pcz);   // fallback: sort by radius from the center
   }
+  var clx = camL.x, cly = camL.y, clz = camL.z;
+  var d2 = this._d2, ord = this._ord;
+  var offB = 0, offP = nB, offV = offP + nW, offC = offV + nV, offS = offC + nC;
+  var e, x2, y2, z2, dx2, dy2, dz2;
+  for (e = 0; e < nB; e++) {
+    i3 = e * 3;
+    dx2 = bPos[i3] - clx; dy2 = bPos[i3 + 1] - cly; dz2 = bPos[i3 + 2] - clz;
+    d2[offB + e] = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  }
+  for (e = 0; e < nW; e++) {
+    i3 = e * 3;
+    dx2 = pPos[i3] - clx; dy2 = pPos[i3 + 1] - cly; dz2 = pPos[i3 + 2] - clz;
+    d2[offP + e] = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  }
+  for (e = 0; e < nV; e++) {
+    i3 = e * 3;
+    dx2 = vPos[i3] - clx; dy2 = vPos[i3 + 1] - cly; dz2 = vPos[i3 + 2] - clz;
+    d2[offV + e] = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  }
+  for (e = 0; e < nC; e++) {
+    i3 = e * 3;
+    dx2 = cPos[i3] - clx; dy2 = cPos[i3 + 1] - cly; dz2 = cPos[i3 + 2] - clz;
+    d2[offC + e] = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  }
+  for (e = 0; e < nS; e++) {
+    i3 = e * 3;
+    dx2 = sPos[i3] - clx; dy2 = sPos[i3 + 1] - cly; dz2 = sPos[i3 + 2] - clz;
+    d2[offS + e] = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  }
+  // ---- bucket sort far → near (64 buckets, allocation-free) ---------------
+  if (sortOn && total > 1) {
+    var hist = this._hist, bkt = this._bkt;
+    var lo = Infinity, hi = -Infinity;
+    for (e = 0; e < total; e++) {
+      var dvv = d2[e];
+      if (dvv < lo) lo = dvv;
+      if (dvv > hi) hi = dvv;
+    }
+    var NB = 64, inv = hi > lo ? (NB - 1) / (hi - lo + 1e-9) : 0;
+    for (e = 0; e < NB; e++) hist[e] = 0;
+    for (e = 0; e < total; e++) {
+      var bk = ((d2[e] - lo) * inv) | 0;
+      if (bk < 0) bk = 0; else if (bk >= NB) bk = NB - 1;
+      hist[bk]++;
+    }
+    var acc = 0;                          // far buckets first → start offsets
+    for (bk = NB - 1; bk >= 0; bk--) { bkt[bk] = acc; acc += hist[bk]; }
+    for (e = 0; e < total; e++) {
+      bk = ((d2[e] - lo) * inv) | 0;
+      if (bk < 0) bk = 0; else if (bk >= NB) bk = NB - 1;
+      ord[bkt[bk]++] = e;
+    }
+  } else {
+    for (e = 0; e < total; e++) ord[e] = e;
+  }
+  // ---- write the sorted draw list ------------------------------------------
+  for (var k = 0; k < total; k++) {
+    e = ord[k];
+    var ax, ay, az, rC, gC, bC, al, sz, sp;
+    if (e < offP) {                     // liquid beads
+      i3 = e * 3;
+      ax = bPos[i3]; ay = bPos[i3 + 1]; az = bPos[i3 + 2];
+      rC = bCol[i3]; gC = bCol[i3 + 1]; bC = bCol[i3 + 2];
+      al = beadA; sz = beadSz; sp = 0;
+    } else if (e < offV) {
+      i3 = (e - offP) * 3;
+      ax = pPos[i3]; ay = pPos[i3 + 1]; az = pPos[i3 + 2];
+      rC = pCol[i3]; gC = pCol[i3 + 1]; bC = pCol[i3 + 2];
+      al = sprayA; sz = spraySz; sp = 1;
+    } else if (e < offC) {
+      i3 = (e - offV) * 3;
+      ax = vPos[i3]; ay = vPos[i3 + 1]; az = vPos[i3 + 2];
+      rC = vCol[i3]; gC = vCol[i3 + 1]; bC = vCol[i3 + 2];
+      al = vapA; sz = vapSz; sp = 2;
+    } else if (e < offS) {
+      i3 = (e - offC) * 3;
+      ax = cPos[i3]; ay = cPos[i3 + 1]; az = cPos[i3 + 2];
+      rC = cCol[i3]; gC = cCol[i3 + 1]; bC = cCol[i3 + 2];
+      al = cloudA; sz = cloudSz; sp = 3;
+    } else {
+      i3 = (e - offS) * 3;
+      ax = sPos[i3]; ay = sPos[i3 + 1]; az = sPos[i3 + 2];
+      rC = sCol[i3]; gC = sCol[i3 + 1]; bC = sCol[i3 + 2];
+      al = snowA; sz = snowSz; sp = 4;
+    }
+    i3 = k * 3;
+    allPos[i3] = ax; allPos[i3 + 1] = ay; allPos[i3 + 2] = az;
+    allCol[i3] = rC; allCol[i3 + 1] = gC; allCol[i3 + 2] = bC;
+    allAlpha[k] = al; allSize[k] = sz; allSprite[k] = sp;
+  }
+  var pa = this.allGeo.getAttribute('position');
+  var ca = this.allGeo.getAttribute('aCol');
+  pa.updateRange.offset = ca.updateRange.offset = 0;
+  pa.updateRange.count = ca.updateRange.count = total * 3;
+  pa.needsUpdate = ca.needsUpdate = true;
+  var aa = this.allGeo.getAttribute('aAlpha');
+  var sa = this.allGeo.getAttribute('aSize');
+  var ta = this.allGeo.getAttribute('aSprite');
+  aa.updateRange.offset = sa.updateRange.offset = ta.updateRange.offset = 0;
+  aa.updateRange.count = sa.updateRange.count = ta.updateRange.count = total;
+  aa.needsUpdate = sa.needsUpdate = ta.needsUpdate = true;
 };
 
 WaterScene.prototype.setParticlesOpacity = function (o) {
   // o in [0,1]: 1 = the default soft semi-transparent look, 0 = hidden.
   // Governs spray droplets and vapor only — the liquid beads follow the
-  // water-surface opacity slider (see setWaterOpacity).
+  // water-surface opacity slider (see setWaterOpacity). The per-class
+  // alphas are baked per particle by the next updateParticles call.
   this.pOpa = o;
-  this.pMat.opacity = Math.min(1, 0.95 * o);
-  this.vMat.opacity = 0.23 * Math.sqrt(o);
 };
 
 // Beads mode: render the liquid body EXCLUSIVELY as flat blue circles — the
@@ -1041,11 +1308,6 @@ WaterScene.prototype.setParticlesOpacity = function (o) {
 WaterScene.prototype.setBeadsMode = function (on) {
   this.beadsMode = !!on;
   if (this.waterMesh) this.waterMesh.visible = !this.beadsMode;
-  if (this.beadsPoints) {
-    this.beadsPoints.visible = this.beadsMode;   // draw range set by updateParticles
-    var op = Math.min(1, Math.max(0, this.waterOpa === undefined ? 0.25 : this.waterOpa));
-    this.beadMat.opacity = op;
-  }
 };
 
 // Water hue from the UI color picker tints the surface and detached spray.
@@ -1336,6 +1598,94 @@ WaterScene.prototype.setAtmosphereHeight = function (height) {
 };
 
 // ------------------------------------------------------------------ rendering
+// Motion blur — a frame-blend (afterimage) pass: the scene renders into an
+// offscreen buffer that is composited with last frame's composite
+// (history = max(current, previous * damp)), then blitted to screen. damp 0
+// disables the pass entirely (default — normal MSAA rendering). The trails
+// give fast orbit moves, spray and swirl a cinematic smear.
+WaterScene.prototype._initBlur = function () {
+  var quadGeo = new THREE.BufferGeometry();
+  quadGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+    -1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0]), 3));
+  quadGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]), 2));
+  quadGeo.setIndex([0, 1, 2, 0, 2, 3]);
+  var mat = new THREE.RawShaderMaterial({
+    uniforms: { tCur: { value: null }, tPrev: { value: null }, damp: { value: 0 } },
+    vertexShader: [
+      'precision highp float;',
+      'attribute vec3 position; attribute vec2 uv;',
+      'varying vec2 vUv;',
+      'void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }'
+    ].join('\n'),
+    fragmentShader: [
+      'precision highp float;',
+      'uniform sampler2D tCur; uniform sampler2D tPrev; uniform float damp;',
+      'varying vec2 vUv;',
+      'void main(){',
+      '  vec3 c = texture2D(tCur, vUv).rgb;',
+      '  vec3 p = texture2D(tPrev, vUv).rgb * damp;',
+      // max-blend: bright movers leave decaying trails, the current frame is
+      // never dimmed by history, and the feedback converges (no blow-up)
+      '  gl_FragColor = vec4(max(c, p), 1.0);',
+      '}'
+    ].join('\n'),
+    depthTest: false, depthWrite: false
+  });
+  var quadScene = new THREE.Scene();
+  var quad = new THREE.Mesh(quadGeo, mat);
+  quad.frustumCulled = false;
+  quadScene.add(quad);
+  this._blur = {
+    amount: 0, rtScene: null, rtA: null, rtB: null, w: 0, h: 0,
+    quadScene: quadScene, quadCam: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1), mat: mat
+  };
+};
+
+// (re)allocate the blend buffers at the current drawing-buffer size — called
+// from render() when active, so resize and pixel-ratio changes are picked up
+WaterScene.prototype._syncBlurRT = function () {
+  var b = this._blur;
+  var w = this.renderer.domElement.width, h = this.renderer.domElement.height;
+  if (b.rtScene && b.w === w && b.h === h) return;
+  if (b.rtScene) { b.rtScene.dispose(); b.rtA.dispose(); b.rtB.dispose(); }
+  var self = this;
+  function mk(depth) {
+    var rt = new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      format: THREE.RGBAFormat, depthBuffer: depth, stencilBuffer: false
+    });
+    // scene shaders must keep writing sRGB-encoded values into the buffer
+    rt.texture.encoding = THREE.sRGBEncoding;
+    return rt;
+  }
+  b.rtScene = mk(true);    // scene pass needs depth
+  b.rtA = mk(false);       // history ping
+  b.rtB = mk(false);       // history pong
+  b.w = w; b.h = h;
+};
+
+WaterScene.prototype.setMotionBlur = function (amount) {
+  if (!this._blur) this._initBlur();
+  var b = this._blur;
+  b.amount = Math.max(0, Math.min(0.95, Number(amount) || 0));
+  if (b.amount <= 0.001 && b.rtScene) {
+    b.rtScene.dispose(); b.rtA.dispose(); b.rtB.dispose();
+    b.rtScene = b.rtA = b.rtB = null; b.w = b.h = 0;   // buffers freed while off
+  }
+};
+
+// starfield visibility + brightness (multiplies the per-star vertex colors)
+WaterScene.prototype.setStars = function (on, brightness) {
+  this._starsOn = !!on;
+  if (brightness !== undefined) this._starBrightness = Math.max(0, Math.min(2, brightness));
+  if (this._starGroup) this._starGroup.visible = this._starsOn;
+  if (this._starLayers) {
+    for (var i = 0; i < this._starLayers.length; i++) {
+      this._starLayers[i].mat.color.setScalar(this._starBrightness);
+    }
+  }
+};
+
 WaterScene.prototype._bindResize = function (container) {
   var self = this;
   window.addEventListener('resize', function () {
@@ -1357,9 +1707,36 @@ WaterScene.prototype.render = function (dt) {
   this.time += dt;
   this._waterTime.value = this.time;
   this.orbit.update();
-  // drifting caustics
-  var t = this.time;
-  this.renderer.render(this.scene, this.camera);
+  // point-sprite attenuation matches the old PointsMaterial convention:
+  // gl_PointSize = worldSize · (0.5 · drawingBufferHeight) / viewDepth
+  if (this.allMat && this.renderer && this.renderer.domElement) {
+    this.allMat.uniforms.uPointScale.value = this.renderer.domElement.height * 0.5;
+  }
+  // subtle star twinkle (per-layer uniform opacity — one sin() per layer)
+  if (this._starLayers && this._starGroup && this._starGroup.visible) {
+    for (var si = 0; si < this._starLayers.length; si++) {
+      var L = this._starLayers[si];
+      L.mat.opacity = Math.min(1, L.base * (1 - L.tw + L.tw * (0.5 + 0.5 * Math.sin(this.time * L.speed + L.phase))));
+    }
+  }
+  var b = this._blur;
+  if (b && b.amount > 0.001) {
+    this._syncBlurRT();
+    var r = this.renderer;
+    r.setRenderTarget(b.rtScene);                    // 1. scene → offscreen
+    r.render(this.scene, this.camera);
+    b.mat.uniforms.tCur.value = b.rtScene.texture;
+    b.mat.uniforms.tPrev.value = b.rtA.texture;
+    b.mat.uniforms.damp.value = b.amount;
+    r.setRenderTarget(b.rtB);                        // 2. blend with history
+    r.render(b.quadScene, b.quadCam);
+    b.mat.uniforms.tCur.value = b.rtB.texture;
+    r.setRenderTarget(null);                         // 3. history → screen
+    r.render(b.quadScene, b.quadCam);
+    var tswap = b.rtA; b.rtA = b.rtB; b.rtB = tswap; // ping-pong
+  } else {
+    this.renderer.render(this.scene, this.camera);
+  }
 };
 
 global.WaterScene = WaterScene;
