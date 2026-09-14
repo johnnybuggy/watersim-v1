@@ -1,10 +1,18 @@
 /*
  * Phase-change substates of the evaporated particle:
  *   steam (2) → cloud (3)   needs cold AND dense surrounding steam, above cloud base
- *   steam (2) → rain (4)    colder than the rain point (steam only)
+ *   steam (2) → rain (4)    colder than the rain point AND airborne ≥ rainLiftAge
+ *                           (fresh parcels get a lift-off window before they
+ *                           may re-condense; the drop sheds its wind speed)
  *   water (0)/rain (4) → snow (5)  below the snow point; melts back when warmed
  *   cloud (3) → steam (2)   warmed past the burn-off point
  * Threshold ordering is clamped (snow ≤ rain − 0.02 ≤ cloud − 0.04).
+ * Evaporation: any liquid above the freezing point may leave, with a
+ * per-second probability  p(T) = intensity · sun · exp(3.5·(T − T_freeze))
+ * (capped at certainty) — the intensity is the coefficient of that formula.
+ * Airborne rain (4) trades heat with the AIR (night floor 0.06), not with
+ * deep space — it lands as rain unless it genuinely chills below the snow
+ * point while falling.
  * Runs the real solver headlessly (box mode — no terrain needed).
  */
 'use strict';
@@ -22,13 +30,29 @@ function mk(overrides) {
 {
   const s = mk();
   s.resetWater(0.5);
-  // one particle high above the sea, cold steam
+  // one particle high above the sea, cold steam, airborne long enough to pass
+  // the lift gate (a fresh parcel below rainLiftAge keeps its lift-off window)
   const p = 0;
   s.pflag[p] = 2; s.pT[p] = 0.1;   // ≤ rainT (0.22)
   s.px[p] = s.cx; s.py[p] = s.cy + s.oceanR + 0.8 * s.atmosphereH; s.pz[p] = s.cz;
   s.pvx[p] = 0.1; s.pvy[p] = 0; s.pvz[p] = 0;
+  s.pAir[p] = s.rainLiftAge + 0.1;
   s._updatePhaseChanges();
-  assert.equal(s.pflag[p], 4, 'cold steam → rain');
+  assert.equal(s.pflag[p], 4, 'cold airborne steam → rain');
+  assert.equal(s.pvx[p], 0, 'rain-out sheds the wind speed (free-fall)');
+  s.disableMultithreading && s.disableMultithreading();
+}
+
+// ---- 1b. freshly lifted steam does NOT rain out before the lift window -------
+{
+  const s = mk();
+  s.resetWater(0.5);
+  const p = 0;
+  s.pflag[p] = 2; s.pT[p] = 0.1;   // ≤ rainT (0.22) — born cold (cold night sea)
+  s.px[p] = s.cx; s.py[p] = s.cy + s.oceanR + 0.8 * s.atmosphereH; s.pz[p] = s.cz;
+  s.pAir[p] = 0;                   // just evaporated: inside the lift window
+  s._updatePhaseChanges();
+  assert.equal(s.pflag[p], 2, 'fresh cold steam keeps its lift-off window');
   s.disableMultithreading && s.disableMultithreading();
 }
 
@@ -132,11 +156,12 @@ function mk(overrides) {
   s.resetWater(0.5);
   const p = 0;
   s.pflag[p] = 2; s.pT[p] = Math.min(s.rainT, s.cloudT - 0.03);   // below effective rainT → rain
+  s.pAir[p] = 1;                                   // airborne past the lift window
   s._updatePhaseChanges();
   assert.equal(s.pflag[p], 4, 'ordering clamp still routes cold steam to rain');
   // a particle between effective thresholds stays steam
   const q = 1;
-  s.pflag[q] = 2;
+  s.pflag[q] = 2; s.pAir[q] = 1;
   s.pT[q] = (Math.min(s.rainT, s.cloudT - 0.02) + s.cloudT) / 2;   // between rain and cloud
   s.px[q] = s.cx; s.py[q] = s.cy + s.oceanR + 0.5 * s.atmosphereH; s.pz[q] = s.cz;
   s._updatePhaseChanges();
@@ -273,7 +298,8 @@ function mk(overrides) {
 {
   const s = mk();
   s.resetWater(0.5);
-  s.sunActivity = 50;               // tau = 1 → probability > 1: certain ejection
+  s.sunActivity = 50;               // intensity law: probability ≥ 1 → certain ejection
+  s.evapIntensity = 1;              // (the coefficient: certainty at any T > freeze)
   s._markFluidCells(0, s.nP);       // rasterize the sea (cells start unmarked)
   // topmost fluid particle in column (i=8, k=8) — a genuine surface-top site
   let topP = -1, topJ = -1;
@@ -307,6 +333,85 @@ function mk(overrides) {
   const [bx, bz] = runEvap(0, 0);
   assert.ok(Math.abs((ax - bx) - 0.5) < 1e-6, 'tangential x adopted from the grid (' + (ax - bx).toFixed(6) + ')');
   assert.ok(Math.abs((az - bz) + 0.25) < 1e-6, 'tangential z adopted from the grid (' + (az - bz).toFixed(6) + ')');
+  s.disableMultithreading && s.disableMultithreading();
+}
+
+// ---- 6f. evaporation intensity: absolute exponential law above the freeze ----
+{
+  const s = mk({ nx: 24, ny: 24, nz: 24, dx: 0.25, targetParticles: 8000 });
+  s.resetWater(0.5);
+  s._markFluidCells(0, s.nP);       // rasterize the sea (cells start unmarked)
+  s.sunActivity = 2;
+
+  // surface-top fluid particles (pool mode: no fluid in the +y neighbour)
+  const tops = [];
+  for (let q = 0; q < s.nP; q++) {
+    if (s.pflag[q] !== 0) continue;
+    const i = Math.floor(s.px[q] / s.dx), j = Math.floor(s.py[q] / s.dx), k = Math.floor(s.pz[q] / s.dx);
+    if (i < 1 || i >= s.nx - 1 || j < 1 || j >= s.ny - 1 || k < 1 || k >= s.nz - 1) continue;
+    if (s.cellType[(k * s.ny + j) * s.nx + i] !== 1) continue;          // FLUID
+    if (s.cellType[(k * s.ny + j + 1) * s.nx + i] === 1) continue;      // covered above
+    tops.push(q);
+  }
+  assert.ok(tops.length > 300, 'enough surface-top sites (' + tops.length + ')');
+
+  const runEvapAt = (T, intensity) => {
+    for (const q of tops) { s.pflag[q] = 0; s.pT[q] = T; }
+    s.evapIntensity = intensity;
+    s._evS = 0x51ab3c77;            // identical stream for every run
+    s._updateEvaporation(1 / 60);
+    let n = 0;
+    for (const q of tops) if (s.pflag[q] === 2) n++;
+    return n;
+  };
+
+  // (a) at or below the freezing point NOTHING evaporates, whatever the intensity
+  const freezeT = Math.max(s.meltT, s.snowT * 1.05);
+  assert.equal(runEvapAt(freezeT, 100), 0, 'water at the freezing point never evaporates');
+  assert.equal(runEvapAt(freezeT - 0.02, 100), 0, 'sub-freezing water never evaporates');
+
+  // (b) any liquid ABOVE the freezing point may leave — even at 0.30, far below
+  // the old evaporation point (0.42): crank the intensity → certainty
+  const warm = runEvapAt(0.30, 100);
+  assert.equal(warm, tops.length, 'warm water above freezing evaporates with certainty');
+
+  // (c) exponential growth with temperature at a moderate intensity
+  const cold = runEvapAt(0.30, 1);
+  const hot = runEvapAt(0.70, 1);
+  assert.ok(cold > 0, 'water just above freezing still seeps some vapor');
+  assert.ok(hot < tops.length, 'moderate intensity keeps hot evaporation sub-certain');
+  const ratio = hot / Math.max(cold, 1);
+  assert.ok(ratio > 2.2 && ratio < 7.5,
+    'evaporation grows exponentially with T (ratio ' + ratio.toFixed(2) + ' ≈ e^(3.5·ΔT) = 4.1)');
+
+  // (d) intensity 0 = dry air even on boiling water
+  assert.equal(runEvapAt(1.0, 0), 0, 'intensity 0 disables evaporation entirely');
+  s.disableMultithreading && s.disableMultithreading();
+}
+
+// ---- 6g. airborne rain trades heat with the AIR, not with deep space ----------
+// The old model relaxed rain to the water ambient with the night target pinned
+// at 0 (radiating to space like deep water) — night rain froze mid-air almost
+// every time. Rain must relax toward the sky ambient (0.06 at night) with a
+// coupling between the steam's and the water's rates.
+{
+  const s = mk();
+  s.resetWater(0.5);
+  s.sunPos = null;                  // box night: everyone unlit
+  // one rain droplet and one water particle, both parked high in the air
+  // (air cells have no other particles → the conduction pass is inert, the
+  // branch relaxation is measured alone), same starting heat
+  const pR = 0, pW = 1;
+  const top = (s.ny - 3) * s.dx;
+  s.pflag[pR] = 4; s.pT[pR] = 0.5;
+  s.px[pR] = 2 * s.dx; s.py[pR] = top; s.pz[pR] = 2 * s.dx;
+  s.pflag[pW] = 0; s.pT[pW] = 0.5;
+  s.px[pW] = (s.nx - 3) * s.dx; s.py[pW] = top; s.pz[pW] = (s.nz - 3) * s.dx;
+  for (let t = 0; t < 25; t++) s._updateHeat(1 / 25);   // 1 simulated second
+  assert.ok(s.pT[pR] > 0.15 && s.pT[pR] < 0.3,
+    'night rain relaxes toward the AIR ambient (0.06), not to absolute zero (T=' + s.pT[pR].toFixed(3) + ')');
+  assert.ok(s.pT[pW] > 0.42,
+    'water keeps the old slow space-radiation cooling (T=' + s.pT[pW].toFixed(3) + ')');
   s.disableMultithreading && s.disableMultithreading();
 }
 

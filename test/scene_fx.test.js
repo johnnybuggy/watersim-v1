@@ -195,6 +195,16 @@ assert.ok(Math.max(cur2, prev * 0.9) >= cur2, 'current frame never dimmed by his
     'bead sprite tile 0 with waterOpa alpha');
   fs.beadsMode = false;
 
+  // metaball mode: the liquid particle hides INSIDE the fused metaball skin —
+  // liquid beads are suppressed even in beads mode (spray/vapor/etc. stay)
+  fs.beadsMode = true; fs.metaballMode = true;
+  fs.updateParticles(solver, true);
+  assert.deepEqual(fs.allGeo.dr, [0, 5], 'metaball mode: fl 0 leaves the draw list');
+  assert.equal(fs._classCounts.beads, 0, 'metaball skin replaces liquid bead circles');
+  fs.metaballMode = false; fs.beadsMode = false;
+  fs.updateParticles(solver, true);
+  assert.deepEqual(fs.allGeo.dr, [0, 5], 'flags restored: fl 0 back on the surface mesh');
+
   // interior-water cull, split by hemisphere: with the solver's
   // overhead-water mirror present, beads for water 2+ cells below the local
   // surface are culled ONLY on the night side (they rendered as
@@ -223,6 +233,36 @@ assert.ok(Math.max(cur2, prev * 0.9) >= cur2, 'current frame never dimmed by his
   assert.equal(fs._classCounts.beads, 1, 'missing pDepth falls back to drawing beads');
   fs._planetLit = false;
   fs.beadsMode = false;
+
+  // spin-velocity color mode: R/G/B = ω components normalized across ALL
+  // particles (global per-component min/max → 0…1; degenerate span → 0.5).
+  // Beads mode ON so the fluid particle stages too (mesh mode hides it).
+  fs.beadsMode = true;
+  fs.spinColor = true;
+  solver.pWx = new Float32Array([-1, 0, 0.5, 1, 0, 2]);   // min −1, max 2 → (v+1)/3
+  solver.pWy = new Float32Array([2, 2, 2, 2, 2, 2]);      // degenerate → 0.5
+  solver.pWz = new Float32Array([0, 4, 1, 3, 2, 0]);      // min 0, max 4 → v/4
+  fs.updateParticles(solver, true);
+  // expected per particle p: sR=(pWx+1)/3, sG=0.5, sB=pWz/4; camera at +x ⇒
+  // far→near = p0…p5 ⇒ sorted entries k0…k5 in particle order
+  // k0 fl0 bead (p0) → (0, 0.5, 0); k1 spray (p1) → (1/3, 0.5, 1);
+  // k2 vapor (p2) → (0.5, 0.5, 0.25); k3 cloud (p3) → (2/3, 0.5, 0.75);
+  // k4 rain (p4) → (1/3, 0.5, 0.5); k5 snow (p5) → (1, 0.5, 0)
+  const spinC = [];
+  for (let k2 = 0; k2 < 6; k2++) spinC.push([fs.allCol[k2 * 3], fs.allCol[k2 * 3 + 1], fs.allCol[k2 * 3 + 2]]);
+  const near = (a, b) => Math.abs(a - b) < 1e-6;
+  const hasSpin = (k2, r, g, b) => near(spinC[k2][0], r) && near(spinC[k2][1], g) && near(spinC[k2][2], b);
+  assert.ok(hasSpin(0, 0, 0.5, 0), 'fluid bead color = normalized ω (global min → 0)');
+  assert.ok(hasSpin(1, 1 / 3, 0.5, 1), 'spray color = normalized ω');
+  assert.ok(hasSpin(2, 0.5, 0.5, 0.25), 'vapor color = normalized ω');
+  assert.ok(hasSpin(3, 2 / 3, 0.5, 0.75), 'cloud color = normalized ω');
+  assert.ok(hasSpin(4, 1 / 3, 0.5, 0.5), 'rain color = normalized ω');
+  assert.ok(hasSpin(5, 1, 0.5, 0), 'snow color = normalized ω (global max → 1)');
+  // normalization spans the WHOLE simulation: pWx min/max land exactly on
+  // 0 and 1 in the drawn colors, pWy (degenerate) reads mid-grey everywhere
+  fs.spinColor = false;
+  fs.beadsMode = false;
+  delete solver.pWx; delete solver.pWy; delete solver.pWz;
 
   // hidden when the spray opacity is 0
   fs.pOpa = 0;

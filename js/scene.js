@@ -197,12 +197,282 @@ function recolorTerrainMesh(mesh, colorHex) {
   colA.needsUpdate = true;
 }
 
+// ---------------------------------------------- terrain detail (procedural)
+// High-detail rock texture for the planet terrain, injected into the terrain
+// material's Phong shader via onBeforeCompile (the same patch pattern as the
+// water material above). Fully procedural — no image assets, no new
+// dependencies:
+//   • multi-octave VALUE-noise fbm albedo variation (~±16% around the palette)
+//   • a second, higher-frequency grain octave (±4%)
+//   • a gentle slope tint (cliffs up to 10% darker) and a warm "dust" tint on
+//     flats vs a cool tint in crevices (±4.5% per channel)
+//   • a cheap tangent-free normal perturbation: the SAME fbm acts as the
+//     height field and dFdx/dFdy provide the screen-space slope (three's own
+//     perturbNormalArb math — no extra noise taps, no UVs, no tangent frame)
+// WORLD-SCALE INVARIANCE: the terrain mesh is built in solver METRES
+// (MarchingTetrahedra emits lattice·dv and the planet group carries no scale),
+// so sampling the noise at the LOCAL surface position with fixed PER-METRE
+// frequencies keeps the texture density constant per metre for every planet
+// radius (0.5–25 m). The frequencies are 1/TERRAIN_*_METRES — derived from a
+// metre constant, never from pixels, dv or grid resolution. True 3D noise is
+// seamless in all three axes, so no triplanar blend is needed (that trick is
+// only required for 2D textures); the sampling is UV-less by construction.
+// The modulation is multiplicative around the vertex palette (beach/green/
+// rock/snow bands + the picker's hue), so the color picker keeps full control.
+// Setup is deterministic and once-per-build (uniform objects + a closure);
+// runtime cost is per-fragment only, like any texture fetch. WebGL1 needs the
+// derivatives extension for dFdx — enabled below; WebGL2 has it as core.
+var TERRAIN_DETAIL_METRES = 0.85;   // base fbm cell size (metres)
+var TERRAIN_GRAIN_METRES = 0.21;    // fine grain cell size (metres)
+var TERRAIN_DETAIL_BUMP = 0.14;     // normal-perturb strength (0 = albedo only)
+
+// GLSL prelude prepended to the fragment shader (outside main): uniforms,
+// varyings and the noise primitives.
+var _TERR_DETAIL_GLSL = [
+  'uniform float uTerrFreq;',       // base fbm frequency, cells per metre
+  'uniform float uTerrGrain;',      // grain frequency, cells per metre
+  'uniform float uTerrBump;',       // derivative-bump strength
+  'uniform vec3 uTerrCenter;',      // planet centre, local metres
+  'varying vec3 vTerrPos;',         // local surface position (metres)
+  'varying vec3 vTerrNrm;',         // local smooth (gouraud) normal
+  'float tHash(vec3 p) {',
+  '  p = fract(p * 0.31831 + vec3(0.71, 0.113, 0.419));',
+  '  p *= 17.0;',
+  '  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));',
+  '}',
+  'float tNoise(vec3 x) {',
+  '  vec3 i = floor(x); vec3 f = fract(x);',
+  '  f = f * f * (3.0 - 2.0 * f);',
+  '  float n00 = tHash(i);',
+  '  float n10 = tHash(i + vec3(1.0, 0.0, 0.0));',
+  '  float n01 = tHash(i + vec3(0.0, 1.0, 0.0));',
+  '  float n11 = tHash(i + vec3(1.0, 1.0, 0.0));',
+  '  float n02 = tHash(i + vec3(0.0, 0.0, 1.0));',
+  '  float n12 = tHash(i + vec3(1.0, 0.0, 1.0));',
+  '  float n03 = tHash(i + vec3(0.0, 1.0, 1.0));',
+  '  float n13 = tHash(i + vec3(1.0, 1.0, 1.0));',
+  '  return mix(mix(mix(n00, n10, f.x), mix(n01, n11, f.x), f.y),',
+  '             mix(mix(n02, n12, f.x), mix(n03, n13, f.x), f.y), f.z);',
+  '}',
+  'float tFbm(vec3 p) {',
+  '  float s = 0.0; float a = 0.52;',
+  '  for (int o = 0; o < 4; o++) {',              // constant bound: WebGL1-safe
+  '    s += a * tNoise(p);',
+  '    p = p * 2.13 + vec3(31.4, 17.7, 11.3);',
+  '    a *= 0.5;',
+  '  }',
+  '  return s / 0.975;',                          // octave weights → 0..1
+  '}'
+].join('\n');
+
+// Wire the detail into a terrain material. The closure runs once per program
+// compile (three caches it by onBeforeCompile.toString(), so terrain rebuilds
+// reuse the compiled program); it never touches per-frame state.
+function applyTerrainDetail(mat, ctr) {
+  mat.onBeforeCompile = function (shader) {
+    shader.uniforms.uTerrFreq = { value: 1 / TERRAIN_DETAIL_METRES };
+    shader.uniforms.uTerrGrain = { value: 1 / TERRAIN_GRAIN_METRES };
+    shader.uniforms.uTerrBump = { value: TERRAIN_DETAIL_BUMP };
+    shader.uniforms.uTerrCenter = { value: new THREE.Vector3(ctr, ctr, ctr) };
+    shader.vertexShader = 'varying vec3 vTerrPos;\nvarying vec3 vTerrNrm;\n' + shader.vertexShader;
+    shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', [
+      '#include <begin_vertex>',
+      'vTerrPos = position; vTerrNrm = normal;'
+    ].join('\n'));
+    shader.fragmentShader = _TERR_DETAIL_GLSL + '\n' + shader.fragmentShader;
+    // albedo: modulate the palette BEFORE lighting so sun/shadows stay correct
+    shader.fragmentShader = shader.fragmentShader.replace('#include <color_fragment>', [
+      '#include <color_fragment>',
+      'vec3 tTerrC = vTerrPos - uTerrCenter;',
+      'float tTerrRad = max(length(tTerrC), 1e-4);',
+      'float tTerrCliff = 1.0 - clamp(dot(normalize(vTerrNrm), tTerrC / tTerrRad), 0.0, 1.0);',
+      'vec3 tTerrP = vTerrPos * uTerrFreq;',                          // metres → noise cells
+      'float tTerrH = tFbm(tTerrP);',                                 // 0..1 base relief
+      'float tTerrGrain = tNoise(vTerrPos * uTerrGrain + 9.3) - 0.5;', // fine grain octave
+      'float tTerrDust = tNoise(tTerrP * 0.23 + 4.7);',               // ~3.7 m dust patches
+      'vec3 tTerrShade = vec3(1.0 + (tTerrH - 0.5) * 0.32 + tTerrGrain * 0.08 - tTerrCliff * 0.10)',
+      '  * mix(vec3(0.962, 0.968, 1.0), vec3(1.045, 1.0, 0.925),',
+      '        smoothstep(0.4, 0.78, tTerrDust) * (1.0 - tTerrCliff));',
+      'diffuseColor.rgb *= tTerrShade;'
+    ].join('\n'));
+    // cheap normal perturbation: tangent-free screen-space derivative bump
+    // over the SAME fbm the albedo uses, mirroring three's perturbNormalArb
+    // (faceDirection comes from <normal_fragment_begin> above this point)
+    shader.fragmentShader = shader.fragmentShader.replace('#include <normal_fragment_maps>', [
+      '#include <normal_fragment_maps>',
+      'vec3 tSgX = vec3(dFdx(-vViewPosition.x), dFdx(-vViewPosition.y), dFdx(-vViewPosition.z));',
+      'vec3 tSgY = vec3(dFdy(-vViewPosition.x), dFdy(-vViewPosition.y), dFdy(-vViewPosition.z));',
+      'vec3 tR1 = cross(tSgY, normal);',
+      'vec3 tR2 = cross(normal, tSgX);',
+      'float tDet = dot(tSgX, tR1) * faceDirection;',
+      'vec3 tGrad = sign(tDet) * (dFdx(tTerrH) * tR1 + dFdy(tTerrH) * tR2);',
+      'normal = normalize(abs(tDet) * normal - uTerrBump * tGrad);'
+    ].join('\n'));
+  };
+  if (!mat.extensions) mat.extensions = {};
+  mat.extensions.derivatives = true;   // WebGL1: emit the dFdx extension line
+  // headless/test observability: the compiled GLSL can only be exercised by a
+  // real renderer, so mirror the patch config in userData (tests assert this)
+  mat.userData.terrainDetail = {
+    patched: true,
+    freqPerMetre: 1 / TERRAIN_DETAIL_METRES,
+    grainPerMetre: 1 / TERRAIN_GRAIN_METRES,
+    metresPerCell: TERRAIN_DETAIL_METRES,
+    grainMetresPerCell: TERRAIN_GRAIN_METRES,
+    bump: TERRAIN_DETAIL_BUMP,
+    center: ctr
+  };
+}
+
+// ------------------------------------------ metaball material (editor-driven)
+// The metaball skin carries its OWN material instance (scene.metaballMat) so
+// the Metaball material editor can restyle the liquid blobs without touching
+// the sea surface. Three editing axes live here:
+//   • shading model — 'physical' (MeshPhysicalMaterial, the water look) |
+//     'matte' (MeshLambertMaterial, diffuse only) | 'unlit' (MeshBasicMaterial,
+//     flat). Swapping rebuilds the material instance, carries over the current
+//     color/opacity/texture/gloss state and disposes the old instance.
+//   • texture type — fully PROCEDURAL (no image assets, no UVs — the marching-
+//     tets mesh has none): 'none' | 'noise' (multi-octave albedo grain) |
+//     'caustic' (bright drifting filaments) | 'stripes' (soft diagonal bands).
+//     All three layers ship in ONE shader patch, each gated by a 0/1 uniform
+//     (uMblaNoise/uMblaCaustic/uMblaStripes) — uniform-gating was chosen over
+//     re-patching per type because three r128 caches programs by
+//     onBeforeCompile.toString(): re-patching with a different captured mode
+//     would silently reuse the old program, while a uniform flip costs
+//     nothing. Uniform-gated branches are cheap (no texture taps when off)
+//     and the layers modulate AROUND the picked color (multiplicative shades
+//     near 1.0), never replacing it.
+//   • glossiness — gloss g maps to roughness = 1 − g and clearcoat = g on the
+//     physical variant (matte/unlit have no specular state; the requested
+//     gloss is kept in scene.metaballGloss and re-applied on a later swap).
+// The patch also carries the water look's two shader behaviours: the animated
+// ripple normal perturbation (lit per-fragment materials only — r128
+// meshlambert_frag lights per-vertex and has no <normal_fragment_maps> chunk
+// to anchor on, and basic is unlit) and the alpha pre-boost (see the waterMat
+// patch below for the r128 chunk-anchor fix). Like the terrain detail, the
+// patch config is mirrored into mat.userData.metaballPatch for headless tests.
+// Everything is deterministic — fixed constants, no Math.random.
+var _MBLA_TEX_TYPES = { none: 1, noise: 1, caustic: 1, stripes: 1 };
+
+// GLSL prelude shared by every metaball material variant: the uniform gates
+// plus the value-noise primitives (same technique as the terrain detail —
+// 3D value noise is seamless in all axes and needs no UVs/tangent frame).
+var _MBLA_TEX_GLSL = [
+  'uniform float uMblaNoise;',     // 0/1 gate: albedo grain layer
+  'uniform float uMblaCaustic;',   // 0/1 gate: bright filament layer
+  'uniform float uMblaStripes;',   // 0/1 gate: directional band layer
+  'float mHash(vec3 p) {',
+  '  p = fract(p * 0.31831 + vec3(0.31, 0.217, 0.613));',
+  '  p *= 17.0;',
+  '  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));',
+  '}',
+  'float mNoise(vec3 x) {',
+  '  vec3 i = floor(x); vec3 f = fract(x);',
+  '  f = f * f * (3.0 - 2.0 * f);',
+  '  float n00 = mHash(i);',
+  '  float n10 = mHash(i + vec3(1.0, 0.0, 0.0));',
+  '  float n01 = mHash(i + vec3(0.0, 1.0, 0.0));',
+  '  float n11 = mHash(i + vec3(1.0, 1.0, 0.0));',
+  '  float n02 = mHash(i + vec3(0.0, 0.0, 1.0));',
+  '  float n12 = mHash(i + vec3(1.0, 0.0, 1.0));',
+  '  float n03 = mHash(i + vec3(0.0, 1.0, 1.0));',
+  '  float n13 = mHash(i + vec3(1.0, 1.0, 1.0));',
+  '  return mix(mix(mix(n00, n10, f.x), mix(n01, n11, f.x), f.y),',
+  '             mix(mix(n02, n12, f.x), mix(n03, n13, f.x), f.y), f.z);',
+  '}',
+  'float mFbm(vec3 p) {',
+  '  float s = 0.0; float a = 0.53;',
+  '  for (int o = 0; o < 3; o++) {',               // constant bound: WebGL1-safe
+  '    s += a * mNoise(p);',
+  '    p = p * 2.17 + vec3(19.3, 7.1, 23.7);',
+  '    a *= 0.5;',
+  '  }',
+  '  return s / 0.925;',                           // octave weights → 0..1
+  '}'
+].join('\n');
+
+// Wire the editor patch into a metaball material. `sc` is the WaterScene
+// whose shared uniform objects (time + texture gates) this material binds —
+// flipping the gate .value after a texture switch re-skins without a recompile.
+function applyMetaballPatch(mat, sc) {
+  var waterTime = sc._waterTime;
+  var texU = sc._mblaTexU;
+  mat.onBeforeCompile = function (shader) {
+    shader.uniforms.uWaterTime = waterTime;
+    shader.uniforms.uMblaNoise = texU.uMblaNoise;
+    shader.uniforms.uMblaCaustic = texU.uMblaCaustic;
+    shader.uniforms.uMblaStripes = texU.uMblaStripes;
+    shader.vertexShader = 'varying vec3 vWaterPosition;\n' + shader.vertexShader;
+    shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\nvWaterPosition = position;');
+    shader.fragmentShader = 'uniform float uWaterTime;\nuniform float uMblaNoise;\n' +
+      'uniform float uMblaCaustic;\nuniform float uMblaStripes;\n' +
+      'varying vec3 vWaterPosition;\n' + _MBLA_TEX_GLSL + '\n' + shader.fragmentShader;
+    // procedural texture layers modulate the albedo BEFORE lighting, around
+    // the picked color (multiplicative, centred on 1.0 — never a replacement)
+    shader.fragmentShader = shader.fragmentShader.replace('#include <color_fragment>', [
+      '#include <color_fragment>',
+      'vec3 mP = vWaterPosition;',
+      'float mShade = 1.0;',
+      'if (uMblaNoise > 0.5) {',
+      '  mShade *= 1.0 + (mFbm(mP * 1.35) - 0.5) * 0.24 + (mNoise(mP * 3.1 + 9.3) - 0.5) * 0.10;',
+      '}',
+      'if (uMblaCaustic > 0.5) {',
+      '  float mR = 1.0 - abs(2.0 * mFbm(mP * 2.3 + vec3(0.0, uWaterTime * 0.4, 0.0)) - 1.0);',
+      '  mShade *= (1.0 + pow(mR, 5.0) * 0.6) * 0.90;',
+      '}',
+      'if (uMblaStripes > 0.5) {',
+      '  float mB = sin(dot(mP, vec3(0.86, 1.42, 0.74)) * 2.6);',
+      '  mShade *= 1.0 + (smoothstep(-0.9, 0.9, mB) - 0.5) * 0.16;',
+      '}',
+      'diffuseColor.rgb *= mShade;'
+    ].join('\n'));
+    // animated ripple — the water look's normal perturbation. Only the
+    // physical variant carries it: r128 meshlambert_frag has no
+    // <normal_fragment_maps> include (its lighting is per-vertex) and basic
+    // is unlit, so there is no per-fragment normal to perturb in either.
+    if (mat.isMeshPhysicalMaterial) {
+      shader.fragmentShader = shader.fragmentShader.replace('#include <normal_fragment_maps>', [
+        '#include <normal_fragment_maps>',
+        'vec3 ripple = vec3(cos(vWaterPosition.z*29.0+uWaterTime*1.1), sin(vWaterPosition.x*31.0-uWaterTime*1.3), cos(vWaterPosition.y*27.0+uWaterTime));',
+        'normal = normalize(normal + mat3(viewMatrix) * ripple * 0.045);'
+      ].join('\n'));
+    }
+    // alpha pre-boost — anchored on <dithering_fragment>, the FINAL chunk of
+    // every r128 lit/unlit template (verified in vendor/three.min.js:
+    // meshphysical/meshlambert/meshbasic all end with it). The old
+    // <output_fragment> anchor does NOT exist in r128 (chunks were renamed),
+    // which made the replace a silent no-op. Placing the boost after
+    // tonemapping + sRGB encoding compensates exactly what the alpha blend
+    // composites (the framebuffer holds encoded values).
+    shader.fragmentShader = shader.fragmentShader.replace('#include <dithering_fragment>', [
+      'gl_FragColor.rgb *= min(1.0 / max(gl_FragColor.a, 0.001), 2.1);',
+      '#include <dithering_fragment>'
+    ].join('\n'));
+  };
+  if (!mat.extensions) mat.extensions = {};
+  mat.extensions.derivatives = true;   // WebGL1: emit the dFdx extension line
+  // headless/test observability: mirror the patch config in userData (tests
+  // assert this — the compiled GLSL needs a real renderer)
+  mat.userData.metaballPatch = {
+    patched: true,
+    shading: sc._mblaShading,
+    ripple: !!mat.isMeshPhysicalMaterial,
+    texture: sc._mblaTex,
+    alphaBoost: true,
+    boostAnchor: 'dithering_fragment',
+    gloss: sc.metaballGloss
+  };
+}
+
 // Build the terrain surface as a marching-tetrahedra isosurface of the
 // solver's radius field: field[c] = R(c) − |c − centre| (positive inside the
 // rock). The contoured surface IS the physics surface (terrainRadiusAt), so
 // the drawn slopes match every collision query exactly — no voxel steps, and
 // the Laplacian-smoothed field gives smooth rolling slopes. Per-vertex
-// palette identical to the old voxel mesh (beach/green/rock/snow bands).
+// palette identical to the old voxel mesh (beach/green/rock/snow bands), plus
+// a procedural high-detail texture patched into the material's shader.
 function buildVoxelTerrainMesh(terrain, colorHex) {
   var n = terrain.n, dv = terrain.dv;
   var Rsl = terrain.Rsl, Rlo = terrain.Rlo, Rhi = terrain.Rhi;
@@ -238,6 +508,9 @@ function buildVoxelTerrainMesh(terrain, colorHex) {
     shininess: 8,                       // matte soil and weathered stone
     specular: 0x0b1010
   });
+  // procedural high-detail rock texture (see the block comment above) —
+  // patched into this material's Phong shader, modulating around the palette
+  applyTerrainDetail(mat, ctr);
   var mesh = new THREE.Mesh(geo, mat);
   mesh.userData.vcount = vcount;
   return mesh;
@@ -492,10 +765,15 @@ function WaterScene(container, W, H, D, opts) {
     // Alpha blending against the black of space multiplies the water body by
     // its opacity — the sea reads "transparent black". Pre-compensate (with a
     // cap so thin settings do not blow out) so the water always shows its own
-    // blue at full strength over dark backgrounds.
-    shader.fragmentShader = shader.fragmentShader.replace('#include <output_fragment>', [
-      '#include <output_fragment>',
-      'gl_FragColor.rgb *= min(1.0 / max(gl_FragColor.a, 0.001), 2.1);'
+    // blue at full strength over dark backgrounds. Anchor: <dithering_fragment>
+    // is the FINAL chunk of the r128 meshphysical template (verified in
+    // vendor/three.min.js). The old <output_fragment> anchor does NOT exist in
+    // r128 (chunks were renamed) — that replace was a silent no-op. Boosting
+    // after tonemapping + sRGB encoding acts on the exact value the alpha
+    // blend composites (the framebuffer holds encoded values).
+    shader.fragmentShader = shader.fragmentShader.replace('#include <dithering_fragment>', [
+      'gl_FragColor.rgb *= min(1.0 / max(gl_FragColor.a, 0.001), 2.1);',
+      '#include <dithering_fragment>'
     ].join('\n'));
   };
   this.waterGeo = new THREE.BufferGeometry();
@@ -508,6 +786,43 @@ function WaterScene(container, W, H, D, opts) {
   this.waterMesh.renderOrder = 4;
   this.planetGroup.add(this.waterMesh);
   this.waterMesh.visible = !this.beadsMode;   // beads mode hides the surface
+
+  // ---------------- metaball water mesh (checkbox display mode) -------------
+  // The water particles' Blinn-style metaball skin (field + march in
+  // surface.js) renders with its OWN material instance (metaballMat) so the
+  // Metaball material editor can restyle the blobs without touching the sea
+  // surface. The instance is SEEDED to match waterMat — same type, color,
+  // opacity, roughness/clearcoat and the same ripple + alpha pre-boost shader
+  // patches — so with no editor input the skin is indistinguishable from the
+  // water. NOTE: Material.clone() does NOT copy onBeforeCompile in r128
+  // (verified in vendor/three.min.js), so the seed is written out explicitly
+  // and applyMetaballPatch attaches the shader patch instead of relying on
+  // waterMat.clone(). Sync rule: the skin's color FOLLOWS the water picker
+  // (setWaterColor keeps both in sync) until the user picks a color in the
+  // editor — setMetaballMaterial({ color }) flips _mblaFollowWater off and the
+  // skin's color stays independent for good. Opacity is NOT synced: the editor
+  // owns the skin's opacity through its own slider (both ship at 0.25).
+  this.metaballMode = false;
+  this._mblaShading = 'physical';    // 'physical' | 'matte' | 'unlit'
+  this._mblaTex = 'none';            // 'none' | 'noise' | 'caustic' | 'stripes'
+  this._mblaFollowWater = true;      // color still follows the water picker
+  this._mblaOpacity = 0.25;          // shipped water opacity (editor slider)
+  this.metaballGloss = 0.95;         // gloss seed = 1 − waterMat.roughness (0.05)
+  this._mblaColor = new THREE.Color(0x9fd4ee);   // the skin's own color state
+  this._mblaTexU = {                 // shared texture-gate uniform objects
+    uMblaNoise: { value: 0 },
+    uMblaCaustic: { value: 0 },
+    uMblaStripes: { value: 0 }
+  };
+  this.metaballMat = this._seedMetaballMaterial();
+  this.metaballGeo = new THREE.BufferGeometry();
+  this.metaballGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+  this.metaballGeo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(9), 3));
+  this.metaballMesh = new THREE.Mesh(this.metaballGeo, this.metaballMat);
+  this.metaballMesh.frustumCulled = false;
+  this.metaballMesh.renderOrder = 4;   // composites over particles like the surface film
+  this.metaballMesh.visible = false;
+  this.planetGroup.add(this.metaballMesh);
 
   // ---------------- particles: ONE combined, camera-sorted Points system ----
   // Every airborne class (liquid beads, glossy spray, vapor, cloud, snow)
@@ -699,9 +1014,10 @@ WaterScene.prototype.setSun = function (x, y, z) {
 // ------------------------------------------------- orbit & rotation motion
 // The sun is FIXED; the planet revolves around it on a horizontal circle
 // (one "year") while spinning about its own vertical axis (one "day"). The
-// sun hovers above the orbital-plane centre so its elevation above the
-// planet's horizon stays constant (~22°, the old moving-sun tilt), and its
-// azimuth now sweeps because the planet travels instead of the sun.
+// sun sits IN the orbital-plane centre (elevation 0): with axial tilt 0 the
+// planet→sun vector stays exactly in the equatorial plane so both poles get
+// symmetric grazing irradiation; with tilt ≠ 0 the sun's latitude over the
+// planet oscillates ±tilt over a year (seasons).
 
 // Periods are in seconds; values <= 0 (or non-finite) freeze that motion.
 WaterScene.prototype.setYearPeriod = function (sec) {
@@ -855,14 +1171,15 @@ WaterScene.prototype._buildSphere = function (W, H, D, opts) {
   // keep working; flip visible back on to restore the glow.
   halo.visible = false;
 
-  // fixed sun + shadow frustum: the sun hovers above the centre of the
-  // orbital circle at the elevation the old moving sun had (0.38 rad) and
-  // keeps its old distance (oceanR * 3.4); the planet revolves around it.
-  var sunDist = oceanR * 3.4, tilt = 0.38;
+  // fixed sun + shadow frustum: the sun sits IN the centre of the orbital
+  // plane (elevation 0) at distance oceanR * 3.4; the planet revolves around
+  // it, so with axial tilt 0 the sun latitude stays 0 (symmetric poles) and
+  // with tilt > 0 it oscillates ±tilt over a year (seasons).
+  var sunDist = oceanR * 3.4;
   this._sunDist = sunDist;
-  this._orbitR = sunDist * Math.cos(tilt);
-  this._sunHeight = sunDist * Math.sin(tilt);
-  this.setSun(cx, cy + this._sunHeight, cz);
+  this._orbitR = sunDist;
+  this._sunHeight = 0;
+  this.setSun(cx, cy, cz);
   var ext = Math.max(6, oceanR * 2.2);
   this.sun.shadow.camera.left = -ext; this.sun.shadow.camera.right = ext;
   this.sun.shadow.camera.top = ext; this.sun.shadow.camera.bottom = -ext;
@@ -914,6 +1231,7 @@ WaterScene.prototype.buildTerrain = function (terrain, colorHex) {
     var ti = this._poolMeshes.indexOf(this._terrainMesh);
     if (ti >= 0) this._poolMeshes.splice(ti, 1);
     this._terrainMesh.geometry.dispose();
+    if (this._terrainMesh.material.map) this._terrainMesh.material.map.dispose();
     this._terrainMesh.material.dispose();
     this._terrainMesh = null;
   }
@@ -986,6 +1304,191 @@ WaterScene.prototype.updateWater = function (pos, nrm, count) {
   geo.setDrawRange(0, count);
 };
 
+// Metaball skin buffers — same refill pattern as updateWater; both display
+// passes feed from the mesher's shared scratch arrays (only one runs/frame).
+WaterScene.prototype.updateMetaballs = function (pos, nrm, count) {
+  var geo = this.metaballGeo;
+  var pa = geo.getAttribute('position');
+  var na = geo.getAttribute('normal');
+  if (!pa || pa.array !== pos) {
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3).setUsage(THREE.DynamicDrawUsage));
+  } else {
+    pa.needsUpdate = true;
+    na.needsUpdate = true;
+  }
+  pa = geo.getAttribute('position'); na = geo.getAttribute('normal');
+  pa.updateRange.offset = na.updateRange.offset = 0;
+  pa.updateRange.count = na.updateRange.count = count * 3;
+  geo.setDrawRange(0, count);
+};
+
+// ------------------------------------------------- metaball material editor
+// Seed material for the metaball skin: a MeshPhysicalMaterial written out
+// with the water surface's EXACT parameters (type, color, opacity, roughness,
+// clearcoat, emissive rule) plus the metaball shader patch. Material.clone()
+// does NOT copy onBeforeCompile in r128 (verified in vendor/three.min.js), so
+// the seed is explicit rather than waterMat.clone(); with no editor input the
+// skin is visually indistinguishable from the water surface.
+WaterScene.prototype._seedMetaballMaterial = function () {
+  var mat = new THREE.MeshPhysicalMaterial({
+    color: 0x9fd4ee,                    // seeded to waterMat's shipped look
+    roughness: 0.05,
+    metalness: 0,
+    transparent: true,
+    opacity: 0.25,
+    side: THREE.FrontSide,
+    depthWrite: false,
+    emissive: new THREE.Color(0x9fd4ee).multiplyScalar(0.24),
+    envMapIntensity: 0.9,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.08
+  });
+  applyMetaballPatch(mat, this);
+  return mat;
+};
+
+// Build a fresh material instance for the current editor state (_mblaShading,
+// _mblaColor, _mblaOpacity, metaballGloss, _mblaTex). Used by the shading-model
+// swap in setMetaballMaterial (material class changes require a new instance);
+// the constructed material always gets the metaball shader patch so the
+// texture layers + alpha pre-boost carry over to every variant.
+WaterScene.prototype._buildMetaballMaterial = function () {
+  var shade = this._mblaShading || 'physical';
+  var col = this._mblaColor || new THREE.Color(0x9fd4ee);
+  var opa = this._mblaOpacity !== undefined ? this._mblaOpacity : 0.25;
+  var gloss = this.metaballGloss !== undefined ? this.metaballGloss : 0.95;
+  var mat;
+  if (shade === 'matte') {
+    // diffuse-only lambert: no roughness/clearcoat state, emissive keeps the
+    // same self-tint trick the water uses so blobs never read black in shade
+    mat = new THREE.MeshLambertMaterial({
+      color: col.clone(),
+      emissive: col.clone().multiplyScalar(0.24),
+      transparent: true,
+      opacity: opa,
+      side: THREE.FrontSide,
+      depthWrite: false
+    });
+  } else if (shade === 'unlit') {
+    // flat basic: color only (basic has no emissive), still alpha-blended
+    mat = new THREE.MeshBasicMaterial({
+      color: col.clone(),
+      transparent: true,
+      opacity: opa,
+      side: THREE.FrontSide,
+      depthWrite: false
+    });
+  } else {
+    // physical: the water look with the editor's gloss mapping
+    mat = new THREE.MeshPhysicalMaterial({
+      color: col.clone(),
+      roughness: 1 - gloss,               // gloss g → roughness 1−g
+      metalness: 0,
+      transparent: true,
+      opacity: opa,
+      side: THREE.FrontSide,
+      depthWrite: false,
+      emissive: col.clone().multiplyScalar(0.24),
+      envMapIntensity: 0.9,
+      clearcoat: gloss,                   // gloss g → clearcoat g
+      clearcoatRoughness: 0.08
+    });
+  }
+  applyMetaballPatch(mat, this);
+  return mat;
+};
+
+// Push the current editor state onto the LIVE material (no rebuild): color /
+// emissive from _mblaColor, opacity (+ transparent — the skin always composites
+// over the particle pass), gloss on the physical variant, texture-gate
+// uniforms. Safe to call repeatedly; also refreshes the patch userData.
+WaterScene.prototype._applyMetaballMaterialState = function () {
+  var m = this.metaballMat;
+  if (!m) return;
+  if (m.color && this._mblaColor) {
+    m.color.set(this._mblaColor);
+    if (m.emissive) m.emissive.set(this._mblaColor).multiplyScalar(0.24);
+  }
+  if (this._mblaOpacity !== undefined) {
+    m.opacity = this._mblaOpacity;
+    m.transparent = true;   // depthWrite false + renderOrder 4: must stay in the sorted transparent pass
+  }
+  if (m.isMeshPhysicalMaterial) {
+    var g = this.metaballGloss !== undefined ? this.metaballGloss : 0.95;
+    m.roughness = 1 - g;
+    m.clearcoat = g;
+  }
+  if (this._mblaTexU) {
+    this._mblaTexU.uMblaNoise.value = this._mblaTex === 'noise' ? 1 : 0;
+    this._mblaTexU.uMblaCaustic.value = this._mblaTex === 'caustic' ? 1 : 0;
+    this._mblaTexU.uMblaStripes.value = this._mblaTex === 'stripes' ? 1 : 0;
+  }
+  if (m.userData && m.userData.metaballPatch) {
+    m.userData.metaballPatch.texture = this._mblaTex;
+    m.userData.metaballPatch.shading = this._mblaShading;
+    m.userData.metaballPatch.gloss = this.metaballGloss;
+  }
+};
+
+// Metaball material editor entry point. Granular, order-independent options
+// (any subset in one call; unlisted properties keep their current state):
+//   color     — '#rrggbb' | hex number: sets the skin's color + emissive
+//               (emissive = color·0.24, like the water) and marks the color
+//               user-owned: setWaterColor stops syncing it (_mblaFollowWater
+//               = false — documented sync rule, see the constructor block).
+//   shading   — 'physical' (default, the water look) | 'matte' (Lambert) |
+//               'unlit' (Basic). Rebuilds the material instance, carries the
+//               color/opacity/gloss/texture state over, disposes the old
+//               instance and repoints metaballMesh.material at the new one.
+//   texture   — 'none' | 'noise' | 'caustic' | 'stripes': flips the uniform
+//               gates of the single patched shader (no rebuild, no recompile).
+//   opacity   — 0..1: material.opacity (material stays transparent; the skin
+//               always alpha-blends over the particle pass).
+//   gloss     — 0..1: roughness = 1−gloss and clearcoat = gloss (physical;
+//               stored for matte/unlit and re-applied on a later swap).
+// Returns the live material. Material-only edits never need a mesh rebuild.
+WaterScene.prototype.setMetaballMaterial = function (opts) {
+  opts = opts || {};
+  if (!this._mblaColor) this._mblaColor = new THREE.Color(0x9fd4ee);
+  if (!this._mblaTexU) {
+    this._mblaTexU = { uMblaNoise: { value: 0 }, uMblaCaustic: { value: 0 }, uMblaStripes: { value: 0 } };
+  }
+  if (this._mblaOpacity === undefined) this._mblaOpacity = 0.25;
+  if (this.metaballGloss === undefined) this.metaballGloss = 0.95;
+  if (!this._mblaShading) this._mblaShading = 'physical';
+  if (!this._mblaTex) this._mblaTex = 'none';
+  var rebuild = false;
+  if (opts.shading !== undefined) {
+    var s = String(opts.shading);
+    if ((s === 'physical' || s === 'matte' || s === 'unlit') && s !== this._mblaShading) {
+      this._mblaShading = s;
+      rebuild = true;
+    }
+  }
+  if (opts.color !== undefined && opts.color !== null && opts.color !== '') {
+    this._mblaFollowWater = false;      // the user owns the color from now on
+    this._mblaColor.set(opts.color);
+  }
+  if (opts.opacity !== undefined && isFinite(opts.opacity)) {
+    this._mblaOpacity = Math.min(1, Math.max(0, Number(opts.opacity)));
+  }
+  if (opts.gloss !== undefined && isFinite(opts.gloss)) {
+    this.metaballGloss = Math.min(1, Math.max(0, Number(opts.gloss)));
+  }
+  if (opts.texture !== undefined && _MBLA_TEX_TYPES[opts.texture]) {
+    this._mblaTex = String(opts.texture);
+  }
+  if (rebuild) {
+    var old = this.metaballMat;
+    this.metaballMat = this._buildMetaballMaterial();
+    if (this.metaballMesh) this.metaballMesh.material = this.metaballMat;   // always the live instance
+    if (old && old !== this.metaballMat && old.dispose) old.dispose();      // free the old program/state
+  }
+  this._applyMetaballMaterialState();
+  return this.metaballMat;
+};
+
 WaterScene.prototype.setWaterOpacity = function (o) {
   this.waterOpa = o;
   this.waterMat.opacity = o;
@@ -1022,8 +1525,10 @@ WaterScene.prototype._ensureParticles = function (n) {
 WaterScene.prototype.updateParticles = function (solver, show) {
   // Liquid droplets (beads mode) answer to the WATER-SURFACE opacity — the
   // droplet cloud IS the water surface in that mode. Rain/spray droplets and
-  // vapor keep answering to the spray/atmosphere opacity slider.
-  var showBeads = !!(show && this.beadsMode && this.waterOpa > 0.01);
+  // vapor keep answering to the spray/atmosphere opacity slider. Metaball
+  // mode replaces the circles with the fused metaball skin, so the liquid
+  // class draws nothing there (it is inside the metaball surface).
+  var showBeads = !!(show && this.beadsMode && this.waterOpa > 0.01 && !this.metaballMode);
   var showSpray = !!(show && this.pOpa > 0.01);
   var anyShow = showBeads || showSpray;
   this.allPts.visible = anyShow;
@@ -1054,6 +1559,29 @@ WaterScene.prototype.updateParticles = function (solver, show) {
   // coordinates live in the solver frame, which spins with the planet, so the
   // sun must be the local-frame direction: the terminator sweeps with the spin.
   var pPh = solver.pPh, spinCue = !!(solver.spinOn && pPh && pPh.length >= n);
+  // spin-velocity color mode (chkSpinColor): every particle's color becomes
+  // its spin angular-velocity vector ω = (ωx, ωy, ωz), each component
+  // normalized to 0…1 across ALL particles in the simulation (global
+  // per-component min/max, so the palette is one consistent scale — min → 0,
+  // max → 1, zero spin → 0.5 grey; degenerate all-equal component → mid).
+  var spinCol = !!this.spinColor;
+  var wRx = 0, wRy = 0, wRz = 0, wMx = 0, wMy = 0, wMz = 0;
+  if (spinCol) {
+    var pWxs = solver.pWx, pWys = solver.pWy, pWzs = solver.pWz, nAll = solver.nP;
+    if (pWxs && pWys && pWzs && pWxs.length >= nAll) {
+      var loX = Infinity, loY = Infinity, loZ = Infinity, hiX = -Infinity, hiY = -Infinity, hiZ = -Infinity;
+      for (var q = 0; q < nAll; q++) {
+        var wxq = pWxs[q], wyq = pWys[q], wzq = pWzs[q];
+        if (wxq < loX) loX = wxq; if (wxq > hiX) hiX = wxq;
+        if (wyq < loY) loY = wyq; if (wyq > hiY) hiY = wyq;
+        if (wzq < loZ) loZ = wzq; if (wzq > hiZ) hiZ = wzq;
+      }
+      wMx = loX; wMy = loY; wMz = loZ;
+      wRx = (hiX > loX) ? 1 / (hiX - loX) : 0; wRy = (hiY > loY) ? 1 / (hiY - loY) : 0; wRz = (hiZ > loZ) ? 1 / (hiZ - loZ) : 0;
+    } else {
+      spinCol = false;   // no spin mirror yet → keep the class colors
+    }
+  }
   var pcx = this.W * 0.5, pcy = this.H * 0.5, pcz = this.D * 0.5;
   var sdx = this._sunDirLocal.x, sdy = this._sunDirLocal.y, sdz = this._sunDirLocal.z;
   var sln = 1;
@@ -1077,15 +1605,26 @@ WaterScene.prototype.updateParticles = function (solver, show) {
     var br = 0.12 + 0.88 * expo;
     var i3;
     var sunnyBead = false;   // day-hemisphere liquid bead (draws normal color)
+    // spin-velocity color: R/G/B = the globally normalized ω components
+    // (a degenerate — all-equal — component reads mid-grey)
+    var sR = 0.5, sG = 0.5, sB = 0.5;
+    if (spinCol) {
+      sR = wRx ? (pWxs[p] - wMx) * wRx : 0.5;
+      sG = wRy ? (pWys[p] - wMy) * wRy : 0.5;
+      sB = wRz ? (pWzs[p] - wMz) * wRz : 0.5;
+    }
     if (fl[p] === 3) {
       if (!showSpray) continue;
       // cloud droplets: light grey, almost solid — brighter than steam and
       // rendered from their own near-opaque sprite
       i3 = nC * 3; nC++;
       cPos[i3] = px[p]; cPos[i3 + 1] = py[p]; cPos[i3 + 2] = pz[p];
-      var cl = 0.30 + 0.70 * br;
-      if (spinCue) cl *= 0.9 + 0.1 * Math.cos(pPh[p]);
-      cCol[i3] = 0.88 * cl; cCol[i3 + 1] = 0.90 * cl; cCol[i3 + 2] = 0.93 * cl;
+      if (spinCol) { cCol[i3] = sR; cCol[i3 + 1] = sG; cCol[i3 + 2] = sB; }
+      else {
+        var cl = 0.30 + 0.70 * br;
+        if (spinCue) cl *= 0.9 + 0.1 * Math.cos(pPh[p]);
+        cCol[i3] = 0.88 * cl; cCol[i3 + 1] = 0.90 * cl; cCol[i3 + 2] = 0.93 * cl;
+      }
       continue;
     }
     if (fl[p] === 5) {
@@ -1094,8 +1633,11 @@ WaterScene.prototype.updateParticles = function (solver, show) {
       // nudges brightness so snow stays white on the night side
       i3 = nS * 3; nS++;
       sPos[i3] = px[p]; sPos[i3 + 1] = py[p]; sPos[i3 + 2] = pz[p];
-      var sw = 0.62 + 0.38 * br;
-      sCol[i3] = sw; sCol[i3 + 1] = sw; sCol[i3 + 2] = sw;
+      if (spinCol) { sCol[i3] = sR; sCol[i3 + 1] = sG; sCol[i3 + 2] = sB; }
+      else {
+        var sw = 0.62 + 0.38 * br;
+        sCol[i3] = sw; sCol[i3 + 1] = sw; sCol[i3 + 2] = sw;
+      }
       continue;
     }
     if (fl[p] === 2) {
@@ -1103,9 +1645,12 @@ WaterScene.prototype.updateParticles = function (solver, show) {
       // Atmospheric parcels overlap into wisps rather than hard motes.
       i3 = nV * 3; nV++;
       vPos[i3] = px[p]; vPos[i3 + 1] = py[p]; vPos[i3 + 2] = pz[p];
-      var cloudLight = 0.22 + 0.78 * br;
-      if (spinCue) cloudLight *= 0.85 + 0.15 * Math.cos(pPh[p]);   // spin twinkle
-      vCol[i3] = 0.76 * cloudLight; vCol[i3 + 1] = 0.85 * cloudLight; vCol[i3 + 2] = cloudLight;
+      if (spinCol) { vCol[i3] = sR; vCol[i3 + 1] = sG; vCol[i3 + 2] = sB; }
+      else {
+        var cloudLight = 0.22 + 0.78 * br;
+        if (spinCue) cloudLight *= 0.85 + 0.15 * Math.cos(pPh[p]);   // spin twinkle
+        vCol[i3] = 0.76 * cloudLight; vCol[i3 + 1] = 0.85 * cloudLight; vCol[i3 + 2] = cloudLight;
+      }
       continue;
     }
     if (fl[p] === 0) {
@@ -1146,11 +1691,16 @@ WaterScene.prototype.updateParticles = function (solver, show) {
       cr = cr * 0.45 + 0.55; cg = cg * 0.45 + 0.55; cb = cb * 0.45 + 0.55;
     }
     if (fl[p] === 0) {   // flat circles: hue × exposure shading — but a
-      // sunny-side bead keeps its NORMAL color (no exposure darkening)
-      var brr = sunnyBead ? 1 : br;
-      bCol[i3] = cr * brr; bCol[i3 + 1] = cg * brr; bCol[i3 + 2] = cb * brr;
+      // sunny-side bead keeps its NORMAL color (no exposure darkening);
+      // spin-color mode replaces the hue with the normalized ω vector
+      if (spinCol) { bCol[i3] = sR; bCol[i3 + 1] = sG; bCol[i3 + 2] = sB; }
+      else {
+        var brr = sunnyBead ? 1 : br;
+        bCol[i3] = cr * brr; bCol[i3 + 1] = cg * brr; bCol[i3 + 2] = cb * brr;
+      }
     } else {             // rain + vapor sprites: hue × exposure shading
-      pCol[i3] = cr * br; pCol[i3 + 1] = cg * br; pCol[i3 + 2] = cb * br;
+      if (spinCol) { pCol[i3] = sR; pCol[i3 + 1] = sG; pCol[i3 + 2] = sB; }
+      else { pCol[i3] = cr * br; pCol[i3 + 1] = cg * br; pCol[i3 + 2] = cb * br; }
     }
   }
   this._classCounts.beads = nB; this._classCounts.spray = nW;
@@ -1307,14 +1857,43 @@ WaterScene.prototype.setParticlesOpacity = function (o) {
 // follows the Water surface opacity slider.
 WaterScene.prototype.setBeadsMode = function (on) {
   this.beadsMode = !!on;
-  if (this.waterMesh) this.waterMesh.visible = !this.beadsMode;
+  if (this.waterMesh) this.waterMesh.visible = !this.beadsMode && !this.metaballMode;
+};
+
+// Metaball mode: the liquid body renders as a blended metaball skin built
+// from the water particles (Blinn field + marching tets in surface.js). It
+// replaces BOTH other water-body renderings — the isosurface mesh stays
+// hidden (like beads mode) and the liquid bead circles are suppressed in
+// updateParticles — while spray / vapor / cloud / snow keep drawing. The skin
+// carries its OWN material (metaballMat, see the constructor block), seeded to
+// match the water and editable through the Metaball material editor.
+WaterScene.prototype.setMetaballs = function (on) {
+  this.metaballMode = !!on;
+  if (this.metaballMesh) {
+    this.metaballMesh.visible = this.metaballMode;
+    if (!this.metaballMode && this.metaballGeo) {
+      // the mesher scratch buffers are shared with the isosurface path —
+      // never let a stale metaball draw range show another pass's vertices
+      this.metaballGeo.setDrawRange(0, 0);
+    }
+  }
+  if (this.waterMesh) this.waterMesh.visible = !this.beadsMode && !this.metaballMode;
 };
 
 // Water hue from the UI color picker tints the surface and detached spray.
+// Metaball editor sync rule: the metaball skin's color FOLLOWS this picker
+// until the user picks a color in the Metaball material editor
+// (setMetaballMaterial({ color }) sets _mblaFollowWater = false) — after that
+// the skin's color stays independent of the water picker for good.
 WaterScene.prototype.setWaterColor = function (hex) {
   this.waterColor.set(hex);
   this.waterMat.color.set(hex);
   this.waterMat.emissive.set(hex).multiplyScalar(0.24);
+  if (this._mblaFollowWater) {
+    if (!this._mblaColor) this._mblaColor = new THREE.Color(hex);
+    else this._mblaColor.set(hex);
+    if (this.metaballMat) this._applyMetaballMaterialState();
+  }
 };
 
 // --------------------------------------------------- water velocity vectors

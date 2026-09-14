@@ -32,7 +32,15 @@
 
 var AIR = 0, FLUID = 1, SOLID = 2;
 
+// Steepness of the evaporation probability's exponential growth with the
+// water temperature: p ∝ exp(EVAP_STEEPNESS·(T − T_freeze)) per second.
+// 3.5 spans roughly two decades over the liquid's working range — the hot
+// day surface steams hard while water just above the freezing point only
+// seeps vapor (see _evapChunk).
+var EVAP_STEEPNESS = 3.5;
+
 function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
 
 function FluidSolver(opts) {
   opts = opts || {};
@@ -153,18 +161,36 @@ function FluidSolver(opts) {
   // particles per neighbouring cell) ≥ cloudP, above the cloud base
   // (30% of the atmosphere height — the barometric profile is bottom-heavy,
   // so without the gate clouds would condense as fog on the sea surface).
-  // steam → rain at T ≤ rainT (ordering-clamped below cloudT); water/rain →
-  // snow at T ≤ snowT (clamped below rainT); melt-back reverses snow.
+  // steam → rain at T ≤ rainT once it has been airborne ≥ rainLiftAge
+  // (ordering-clamped below cloudT); water/rain → snow at T ≤ snowT
+  // (clamped below rainT); melt-back reverses snow.
   this.cloudT = opts.cloudT !== undefined ? opts.cloudT : 0.34;
   this.cloudP = opts.cloudP !== undefined ? opts.cloudP : 0.35;
   this.rainT = opts.rainT !== undefined ? opts.rainT : 0.22;
+  // A freshly evaporated parcel is born at the water's own temperature — on a
+  // cold night that can already be BELOW the rain point, which would make it
+  // re-condense the same frame and turn every cold-water evaporation into an
+  // invisible one-frame flicker. The lift gate therefore requires steam to be
+  // airborne for this many seconds before the temperature rule can rain it
+  // out: the Maxwell–Boltzmann kick carries it visibly off the surface first.
+  // (Stale-haze rain-out at pAir > 40 s is unaffected — see the motion pass.)
+  this.rainLiftAge = opts.rainLiftAge !== undefined ? opts.rainLiftAge : 0.4;
   this.snowT = opts.snowT !== undefined ? opts.snowT : 0.10;
-  // melt / evaporate conversion points (Clouds & precipitation sliders).
-  // Conversion needs 5% MORE heat than the phase-equilibrium point: ice
-  // melts at snowT×1.05 (the melt slider may raise it), water evaporates at
-  // evapT×1.05 (evapT 0.40 ≈ the hot-day surface band at shipped sun).
+  // melt conversion point (the "Ice melt point" slider). Ice melts at 5%
+  // MORE heat than the phase-equilibrium point: snowT×1.05 (the slider may
+  // raise it). The freezing point = that same effective melt value — water at
+  // or below it is ice.
   this.meltT = opts.meltT !== undefined ? opts.meltT : this.snowT * 1.05;
-  this.evapT = opts.evapT !== undefined ? opts.evapT : 0.40;
+  // ---- evaporation intensity (replaces the old evaporation-point gate) ----
+  // Surface water may leave for the sky at ANY temperature above the freezing
+  // point: the per-second escape probability grows EXPONENTIALLY with the
+  // water temperature, and the intensity is the coefficient of that formula,
+  //   p(T) [1/s] = evapIntensity · sunActivity · exp(EVAP_STEEPNESS·(T − T_freeze))
+  // (capped at certainty). T_freeze is the effective melt point above, so the
+  // curve always starts exactly where water stops being liquid: 0 below it,
+  // a slow cold seep just above, and vigorous steaming as the surface warms.
+  // Sun activity keeps scaling the whole water cycle; intensity 0 = dry air.
+  this.evapIntensity = opts.evapIntensity !== undefined ? opts.evapIntensity : 0.05;
   this._steamCnt = new Int32Array(this.nCells);   // steam density scratch grid
   this._iceIdx = [];                              // snow contact sweep scratch
   this._hCnt = this._alloc('_hCnt', Int32Array, 1); this._hStart = this._alloc('_hStart', Int32Array, 1);
@@ -925,6 +951,12 @@ FluidSolver.prototype._markFluidCells = function (p0, p1) {
   // supported forever ("water under a lid"). maxSpeed keeps normal surface
   // water well below this line, so it can never act as a suspension shelf.
   var jTop = ny - 2;
+  // altitude over the local terrain beyond which a fluid bead counts as
+  // "sea in the sky". 0.3 was tuned for the classic small world; on big
+  // planets the rasterized rock CELL band reaches ~0.9 dx above the smooth
+  // mesh, so a freshly beached droplet must not read as airborne — scale
+  // the gate with the cell size (beached puddles park at ≤ ~1.5 dx).
+  var skyAlt = 2 * dx > 0.3 ? 2 * dx : 0.3;
   for (var p = p0; p < p1; p++) {
     if (flg[p] !== 0) continue;   // droplets and vapor never mark cells
     // A stray re-entered parcel cannot create a pressure-supported sea in
@@ -936,7 +968,7 @@ FluidSolver.prototype._markFluidCells = function (p0, p1) {
       // shell is resting on terrain, not flying — demoting it made summit
       // particles flap between spray and puddle (visible blinking)
       if (radius2 > (this.oceanR + 0.3) * (this.oceanR + 0.3) &&
-          Math.sqrt(radius2) - this.terrainRadiusAt(px[p], py[p], pz[p]) > 0.3 &&
+          Math.sqrt(radius2) - this.terrainRadiusAt(px[p], py[p], pz[p]) > skyAlt &&
           !this._rockCellAt(px[p], py[p], pz[p])) {
         flg[p] = 1; continue;
       }
@@ -1886,6 +1918,29 @@ FluidSolver.prototype._advectChunk = function (p0, p1, dt) {
             tries0 = 1;
           }
           if (tries0 > 0) {
+            // Park on the VISIBLE surface: the rasterized rock band extends
+            // well above the smooth mesh, so walking out of it pops the
+            // droplet 0.3–0.8 into the air — exactly the band the "sea in the
+            // sky" demote pass then bounces as spray forever (rainfall on a
+            // mountain never beached; it hopped downwind to the sea). Pull
+            // the landed droplet back down to the smooth surface + a hair so
+            // it stays a beached, grid-coupled puddle that creeps downhill.
+            if (hasTerr) {
+              var exS = x - cx, eyS = y - cy, ezS = z - cz;
+              var erS = Math.sqrt(exS * exS + eyS * eyS + ezS * ezS) || 1e-9;
+              var wantS = this.terrainRadiusAt(x, y, z) + dx * 0.06;
+              if (erS > wantS) {
+                x = cx + exS / erS * wantS; y = cy + eyS / erS * wantS; z = cz + ezS / erS * wantS;
+              }
+              // the parked spot can itself rasterize rock (its CELL centre
+              // sits below the smooth mesh) — step out so no landed droplet
+              // is ever left inside the rasterized solid
+              var kS = 0;
+              while (this._rockCellAt(x, y, z) && kS < 4) {
+                x += exS / erS * dx * 0.5; y += eyS / erS * dx * 0.5; z += ezS / erS * dx * 0.5;
+                kS++;
+              }
+            }
             var vr1 = (pvx[p] * bx + pvy[p] * by + pvz[p] * bz) / br;
             pvx[p] -= bx / br * vr1; pvy[p] -= by / br * vr1; pvz[p] -= bz / br * vr1;
             pvx[p] *= 0.3; pvy[p] *= 0.3; pvz[p] *= 0.3;
@@ -2102,11 +2157,15 @@ FluidSolver.prototype._advectChunk = function (p0, p1, dt) {
         pvx[p] = 0; pvy[p] = 0; pvz[p] = 0;
         this.pAir[p] = 0;
         fl[p] = 0;
-      } else if (fl[p] === 2 && (Tv < rainTe || this.pAir[p] > 40)) {
+      } else if (fl[p] === 2 && ((Tv <= rainTe && this.pAir[p] >= this.rainLiftAge) || this.pAir[p] > 40)) {
         // cold (or stale) steam rains out mid-air: sheds its speed and
-        // free-falls; gravity and the spray rules take over. Cloud droplets
-        // are exempt — only steam produces rain (the phase pass owns the
-        // transitions), so clouds persist until warmed or absorbed.
+        // free-falls; gravity and the spray rules take over. The temperature
+        // rule additionally waits for rainLiftAge seconds aloft — a fresh
+        // parcel born at the sea's own (cold-night) temperature would
+        // otherwise re-condense the same frame and no vapor would ever be
+        // visible over cold water; give it the lift-off window first. Cloud
+        // droplets are exempt — only steam produces rain (the phase pass
+        // owns the transitions), so clouds persist until warmed or absorbed.
         pvx[p] = 0; pvy[p] = 0; pvz[p] = 0;
         this.pAir[p] = 0;
         fl[p] = 4;
@@ -2166,6 +2225,23 @@ FluidSolver.prototype._advectChunk = function (p0, p1, dt) {
           tries++;
         }
         if (tries > 0) {
+          // same visible-surface park as the ballistic landing: after walking
+          // out of the rasterized rock band, pull the particle back down to
+          // the smooth surface + a hair — a popped-out puddle bead reads as
+          // "sea in the sky" to the demote pass and blinks/bounces forever
+          if (hasTerr) {
+            var exS2 = x - cx, eyS2 = y - cy, ezS2 = z - cz;
+            var erS2 = Math.sqrt(exS2 * exS2 + eyS2 * eyS2 + ezS2 * ezS2) || 1e-9;
+            var wantS2 = this.terrainRadiusAt(x, y, z) + dx * 0.06;
+            if (erS2 > wantS2) {
+              x = cx + exS2 / erS2 * wantS2; y = cy + eyS2 / erS2 * wantS2; z = cz + ezS2 / erS2 * wantS2;
+            }
+            var kS2 = 0;                       // never leave a bead inside
+            while (this._rockCellAt(x, y, z) && kS2 < 4) {   // rasterized rock
+              x += exS2 / erS2 * dx * 0.5; y += eyS2 / erS2 * dx * 0.5; z += ezS2 / erS2 * dx * 0.5;
+              kS2++;
+            }
+          }
           var vr2 = (pvx[p] * nx2 + pvy[p] * ny2 + pvz[p] * nz2) / nr;
           if (vr2 < 0) {
             pvx[p] -= nx2 / nr * vr2; pvy[p] -= ny2 / nr * vr2; pvz[p] -= nz2 / nr * vr2;
@@ -2812,8 +2888,21 @@ FluidSolver.prototype._heatShadowChunk = function (p0, p1, dt) {
       var cldK = sun ? 0.10 + (1 - lit) * 0.12 : 0.9;
       T = pT[p] + (cldAmb - pT[p]) * cldK * dt;
       if (lit > 0) T += sunPow * 0.35 * lit * dt;
+    } else if (fl[p] === 4) {
+      // falling rain: AIRBORNE precipitation — it trades heat with the air it
+      // falls through (day sky ambient above the sea, near-space cold at
+      // night) and the sun, NOT with the ocean it is about to land in. The
+      // old model relaxed rain to the water ambient with the night target
+      // pinned at 0, so night-side rain radiated to space like deep water
+      // and froze into snow mid-air almost every time; freezing rain is now
+      // a genuine cold-air case (the drop must chill below the snow point
+      // while it falls) instead of the default night outcome.
+      var rainAmb = lit > 0.05 ? Tamb + 0.18 : 0.06;
+      var rainK = sun ? 0.14 + (1 - lit) * 0.16 : 1.0;
+      T = pT[p] + (rainAmb - pT[p]) * rainK * dt;
+      if (lit > 0) T += sunPow * 0.45 * lit * dt;
     } else {
-      // liquid (and freezing rain / snow): the relaxation target is the sun
+      // liquid (and snow): the relaxation target is the sun
       // state — lit water rides the ocean ambient, but water seeing NO sun
       // radiation (night side, terrain shade, depth) radiates to space and
       // cools all the way to 0. Warm neighbours still share heat through the
@@ -2907,51 +2996,39 @@ FluidSolver.prototype._heatConvectChunk = function (p0, p1, dt) {
 // ------------------------------------------------------------- evaporation
 // Surface water leaves the liquid: a fluid particle whose cell has no fluid
 // above it (along local "up") may evaporate into levitating vapor (pflag 2) —
-// on the sunlit side AND on the dark side. The probability is interpolated as
-// an EXPONENTIAL GROWTH curve across the live water temperature range:
-// τ = (T − Tmin)/(Tmax − Tmin) over all current water, p ∝ exp(C·(τ − 1)),
-// so the hottest water steams ~e^C (≈150×) faster than the coldest. Sun-warm
-// day water therefore evaporates fast while cold night water only seeps —
-// the dark side is never fully dry. The escape kick is MAXWELL–BOLTZMANN
-// (thermal speed spectrum, σ scaled by τ), which under the slight atmospheric
-// gravity gives the vapor a bottom-heavy barometric height profile. Sun
-// activity scales the whole curve; the seeded PRNG keeps every run
-// deterministic.
+// on the sunlit side AND on the dark side. ANY liquid water above the
+// freezing point may leave; the escape probability grows EXPONENTIALLY with
+// the water temperature, p ∝ exp(EVAP_STEEPNESS·(T − T_freeze)) per second
+// scaled by the evaporation intensity × sun activity — so the hot day
+// surface boils off while water just above the freezing point only seeps.
+// The escape kick is MAXWELL–BOLTZMANN (thermal speed spectrum, σ scaled by
+// the absolute normalized heat), which under the slight atmospheric gravity
+// gives the vapor a bottom-heavy barometric height profile. Sun activity
+// scales the whole curve; the seeded PRNG keeps every run deterministic.
 FluidSolver.prototype._updateEvaporation = function (dt) {
-  var rate = this.sunActivity;
-  if (rate <= 0) return;
-  var range = this._evapRangeChunk(0, this.nP);
-  var Tmin = range[0], Tmax = range[1];
-  if (!isFinite(Tmin) || !isFinite(Tmax)) return;
-  this.evapCount = this._evapChunk(0, this.nP, dt, Tmin, Tmax);
+  if (this.sunActivity <= 0 || this.evapIntensity <= 0) return;
+  this.evapCount = this._evapChunk(0, this.nP, dt);
 };
 
-// Live water temperature range over the EVAPORATION-ELIGIBLE population
-// (above the evaporation point) — the ejection probability curve is
-// normalized across the water that can actually leave. Serial helper.
-FluidSolver.prototype._evapRangeChunk = function (p0, p1) {
-  var pT = this.pT, fl = this.pflag;
-  var evapGate = this.evapT * 1.05;
-  var Tmin = Infinity, Tmax = -Infinity, T, q;
-  for (q = p0; q < p1; q++) {
-    if (fl[q] === 2) continue;
-    T = pT[q];
-    if (T < evapGate) continue;   // below the evaporation point: ineligible
-    if (T < Tmin) Tmin = T;
-    if (T > Tmax) Tmax = T;
-  }
-  return [Tmin, Tmax];
+// The freezing point that gates evaporation: the effective melt value (the
+// melt slider may raise it above snowT×1.05). Water at or below it is ice and
+// cannot leave for the sky; the exponential curve starts exactly there.
+FluidSolver.prototype._evapFreezeT = function () {
+  return Math.max(this.meltT, this.snowT * 1.05);
 };
 
 // Surface ejection pass (per particle, chunkable; the RNG stream is re-seeded
-// per chunk). Returns the chunk's evaporation count. Water only leaves for
-// the sky once heated 5% ABOVE the evaporating point (the vapor point
-// slider; the rain point is the same phase equilibrium seen from the air
-// side) — colder surface water stays put however sunny it is.
-FluidSolver.prototype._evapChunk = function (p0, p1, dt, Tmin, Tmax) {
-  var rate = this.sunActivity;
+// per chunk). Returns the chunk's evaporation count. The ejection probability
+// is an ABSOLUTE exponential law in the water temperature — no band
+// normalization, no evaporation point:
+//   p(T) [1/s] = intensity · sun · exp(EVAP_STEEPNESS·(T − T_freeze))
+// clamped to certainty. Any liquid water above the freezing point may leave;
+// warmer water leaves exponentially faster (the hot day surface boils off,
+// the cold night sea only seeps). The seeded PRNG keeps runs deterministic.
+FluidSolver.prototype._evapChunk = function (p0, p1, dt) {
+  var rate = this.sunActivity * this.evapIntensity;
   if (rate <= 0) return 0;
-  var evapGate = this.evapT * 1.05;
+  var freezeT = this._evapFreezeT();
   var px = this.px, py = this.py, pz = this.pz, pT = this.pT;
   var fl = this.pflag, pAir = this.pAir;
   var pvx = this.pvx, pvy = this.pvy, pvz = this.pvz;
@@ -2959,19 +3036,18 @@ FluidSolver.prototype._evapChunk = function (p0, p1, dt, Tmin, Tmax) {
   var sphere = this.mode === 'sphere';
   var cx = this.cx, cy = this.cy, cz = this.cz;
   var evapN = 0, T;
-  var span = Tmax - Tmin; if (span < 0.15) span = 0.15;   // degenerate guard
-  var C = 5;                                    // exponential steepness
-  var invSpan = 1 / span;
+  var C = EVAP_STEEPNESS;                         // exponential steepness
+  var T_CAP = 1.15;                               // the thermal clamp in _heatShadowChunk
   for (var p = p0; p < p1; p++) {
     if (fl[p] !== 0) continue;
     T = pT[p];
+    if (T <= freezeT) continue;   // at/below the freezing point: ice, no take-off
     var i = px[p] / dx | 0, j = py[p] / dx | 0, k = pz[p] / dx | 0;
     if (i < 1) i = 1; else if (i > nx - 2) i = nx - 2;
     if (j < 1) j = 1; else if (j > ny - 2) j = ny - 2;
     if (k < 1) k = 1; else if (k > nz - 2) k = nz - 2;
     var c = (k * ny + j) * nx + i;
     if (type[c] !== FLUID) continue;
-    if (T < evapGate) continue;   // below the evaporation point: no take-off
     // surface-top: no fluid in the neighbouring cell along local "up"
     if (sphere) {
       var ex = px[p] - cx, ey = py[p] - cy, ez = pz[p] - cz;
@@ -2984,13 +3060,14 @@ FluidSolver.prototype._evapChunk = function (p0, p1, dt, Tmin, Tmax) {
     } else if (j + 1 <= ny - 2 && type[c + nx] === FLUID) {
       continue;
     }
-    // exponential heat-gated probability (seeded, deterministic). τ is
-    // measured DOWN from the hottest eligible water so the hottest surface
-    // parcel always sits at τ = 1 (full probability) even when the eligible
-    // band is narrow or degenerate (single eligible particle).
-    var tau = 1 - (Tmax - T) * invSpan;
+    // exponential temperature-gated probability (seeded, deterministic).
+    // τ here is the ABSOLUTE normalized heat above the freezing point — it
+    // only shapes the Maxwell–Boltzmann escape spectrum (σ ∝ √τ, the
+    // physical √T scaling), the probability itself is the intensity·exp law.
+    var tau = (T - freezeT) / (T_CAP - freezeT);
     if (tau < 0) tau = 0; else if (tau > 1) tau = 1;
-    var prob = rate * 1.6 * dt * Math.exp(C * (tau - 1));
+    var prob = rate * dt * Math.exp(C * (T - freezeT));
+    if (prob > 1) prob = 1;                       // certainty cap (hot + cranked)
     this._evS = (this._evS * 1664525 + 1013904223) >>> 0;
     var rnd = this._evS / 4294967296;
     if (rnd > prob) continue;
@@ -3051,7 +3128,8 @@ FluidSolver.prototype._evGauss = function () {
 // Substates of the evaporated particle, evaluated once per frame (serial on
 // the coordinator, like _vaporCollisions — the 27-cell steam density scan is
 // cheap next to the collision sweep):
-//   steam (2) → rain (4)      T ≤ rainT            (only steam rains out)
+//   steam (2) → rain (4)      T ≤ rainT, airborne ≥ rainLiftAge
+//                             (only steam rains out; the drop sheds its speed)
 //   steam (2) → cloud (3)     T ≤ cloudT AND local steam density ≥ cloudP,
 //                             above the cloud base (30% of the atmosphere)
 //   cloud (3) → steam (2)     T ≥ cloudT + 0.05    (sun-warmed clouds burn off)
@@ -3137,7 +3215,16 @@ FluidSolver.prototype._updatePhaseChanges = function (dt) {
     var T = pT[p];
     if (T <= 1e-3) continue;                                      // thermal not live
     if (f === 2) {
-      if (T <= rainT) { fl[p] = 4; this.pAir[p] = 0; this.pWx[p] = this.pWy[p] = this.pWz[p] = 0; continue; }   // rains out
+      // rains out: only once it has been airborne rainLiftAge seconds (fresh
+      // parcels get their lift-off window — see the motion pass) and it
+      // sheds its wind speed like the mid-air rule, so rain enters free-fall
+      // instead of drifting downwind at jet speed.
+      if (T <= rainT && this.pAir[p] >= this.rainLiftAge) {
+        fl[p] = 4; this.pAir[p] = 0;
+        this.pvx[p] = this.pvy[p] = this.pvz[p] = 0;
+        this.pWx[p] = this.pWy[p] = this.pWz[p] = 0;
+        continue;
+      }
       if (T > cloudT) continue;                                     // too warm for cloud
       if (sphere) {
         if (Math.sqrt((px[p] - cx) * (px[p] - cx) + (py[p] - cy) * (py[p] - cy) + (pz[p] - cz) * (pz[p] - cz)) < cloudBase) continue;
@@ -3412,7 +3499,11 @@ FluidSolver.prototype._pushSurfaceChunk = function (p0, p1) {
   var pvx = this.pvx, pvy = this.pvy, pvz = this.pvz, fl = this.pflag;
   var cx = this.cx, cy = this.cy, cz = this.cz, dx = this.dx;
   for (var p = p0; p < p1; p++) {
-    if (fl[p] === 5) continue;   // snow is frozen — never repositioned
+    // Snow is frozen in place, but a flake that froze inside a rock-rasterizing
+    // cell (rain freezing exactly as it parks on a night slope) must still be
+    // walked out of solid rock — embedding correction is positional, never a
+    // motion change, so the freeze itself stays put. Snow keeps skipping the
+    // buried-FLUID lift further down (that branch is fl 0 only).
     var x = px[p], y = py[p], z = pz[p];
     var ex = x - cx, ey = y - cy, ez = z - cz;
     var er = Math.sqrt(ex * ex + ey * ey + ez * ez) || 1e-9;
@@ -3441,6 +3532,26 @@ FluidSolver.prototype._pushSurfaceChunk = function (p0, p1) {
       while (this._rockCellAt(x, y, z) && tries < this.nx * 2) {
         x += ex / er * dx * 0.5; y += ey / er * dx * 0.5; z += ez / er * dx * 0.5;
         tries++;
+      }
+      // visible-surface park (same as the ballistic landing and the advection
+      // walk-out): the rock CELL band can extend a full cell above the smooth
+      // mesh, so walking out of it leaves the particle 0.3–0.9 in the air —
+      // the "sea in the sky" demote pass then bounces it as spray forever.
+      // Pull everything that was inside rock back down onto the smooth
+      // surface + a hair; the parked spot may itself rasterize rock (its cell
+      // centre is below the surface), which just means the pass repeats next
+      // step — positionally stable, and the droplet reads as a beached
+      // puddle on the slope instead of teleporting down to the sea.
+      var exR = x - cx, eyR = y - cy, ezR = z - cz;
+      var erR = Math.sqrt(exR * exR + eyR * eyR + ezR * ezR) || 1e-9;
+      var wantR = this.terrainRadiusAt(x, y, z) + dx * 0.06;
+      if (erR > wantR) {
+        x = cx + exR / erR * wantR; y = cy + eyR / erR * wantR; z = cz + ezR / erR * wantR;
+      }
+      var kR = 0;                        // and never inside rasterized rock
+      while (this._rockCellAt(x, y, z) && kR < 4) {
+        x += exR / erR * dx * 0.5; y += eyR / erR * dx * 0.5; z += ezR / erR * dx * 0.5;
+        kR++;
       }
       fixed = true;
     } else if (fl[p] === 0 && er <= this.domainR) {

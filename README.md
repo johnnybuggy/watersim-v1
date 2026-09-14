@@ -40,19 +40,32 @@ threaded** — the stats badge reads "Physics: CPU · single thread".
 | Buttons | Pause · Reset water · Clear balls · 🌍 Earth mode |
 | Keys | `Space` pause · `R` reset · `S` splash · `B` ball · `V` velocity vectors · `P` particles |
 
+**Camera** — drag to orbit with **full polar freedom**: swing over both
+poles and look up at the globe from directly underneath the south pole.
+Wheel zooms with limits that scale with planet size (close approach on a
+0.5 m world, wide pull-back from a 25 m one), with the same smoothed feel
+as before. A 0.01 rad margin off the exact pole axis keeps the view stable
+— no flips or glitches at the poles.
+
 The temperature chart marks the three phase thresholds on its axis — a
 **C** tick (light grey) at the cloud point, **R** (blue) at the rain point
 and **S** (white) at the snow point, all tracking the sliders live. Two more
-thresholds live in the same fold: the **Ice melt point** (ice melts back only
-when heated 5 % above it, and it can never sit below the snow point) and the
-**Evaporation point** (water leaves the sea only when heated 5 % above it).
+climate knobs live in the same tab: the **Ice melt point** (ice melts back
+only when heated 5 % above it, and it can never sit below the snow point)
+and the **Evaporation intensity** — the coefficient of the evaporation law:
+any liquid above the freezing point can leave the sea, with a per-second
+probability that grows exponentially with the water temperature.
 
 The starfield is prominent by default (denser, larger, brighter layers) and
 the *Star brightness* slider (0–2) dims or boosts it further.
 
-The control panel is **fully collapsible** — it starts collapsed (on a phone
-it would cover most of the screen); tap the ☰ button (top-left) or press
-**Tab** to open it, ✕ or Tab to close.
+The control panel is **one big centered pane with five tabs** — *Physics*,
+*Display*, *Planet*, *Orbit* and *Climate* — so every setting group is two
+clicks away and the planet stays visible around it. Pause / Reset water /
+Earth mode / Clear sit in a strip above the tabs and stay visible
+everywhere. The pane is **fully collapsible** (it starts collapsed,
+phone-friendly); tap the ☰ button (top-left) or press **Tab** to open it,
+✕ or Tab to close.
 
 ## Visualization controls
 
@@ -68,10 +81,18 @@ buffer lifecycle, the ping-pong routing and the decay math headlessly.
 
 **Particle temperature chart** (bottom-right HUD, beside the stats block) —
 a live histogram of `solver.pT` (36 bins over the solver's normalized 0–1.2
-temperature scale) with two series: liquid water (blue) and evaporated
-vapor (`pflag === 2`, amber). Redrawn on the 0.3 s stats tick; hidden when
-the canvas is absent. Useful for watching day/night cooling, sun-lit
-surface heating, and night-side condensation of the vapor population.
+temperature scale) showing **five phase classes** as grouped columns, each
+binned by particle temperature and plotted as its share of all particles:
+liquid **water** (fluid + spray, blue), **vapor** (`pflag === 2`, amber),
+**ice** (the frozen/snow population `pflag === 5`, white), **rain**
+(`pflag === 4`, dark blue) and **cloud** (`pflag === 3`, grey) — see the
+on-canvas legend. The vertical axis is a **log10 scale over four decades**:
+a column's height maps the class's per-bin share through log10, from 10⁰ at
+the top down to a 10⁻⁴ floor at the baseline (shares below the floor clip
+to the bottom), labeled with decade ticks (10⁰, 10⁻²) and a log₁₀ tag.
+Redrawn on the 0.3 s stats tick; hidden when the canvas is absent. Useful
+for watching day/night cooling, sun-lit surface heating, and night-side
+condensation of the vapor population.
 
 **Stars** (checkbox + brightness slider) — a three-layer starfield
 (~1,800 points: faint dust, mid field, and a few additive glow sprites)
@@ -218,7 +239,11 @@ shade across the water.
 The sun is **fixed**. The planet **revolves around it** — one "year" every
 20 minutes by default (*Year — orbit around the Sun* slider) — and **spins
 about its vertical axis**, one "day" every 5 minutes by default (*Day —
-spin about its axis* slider). The spin axis can be **tilted against the
+spin about its axis* slider). Both period sliders are **logarithmic**: the
+day runs from **5 seconds to 30 minutes**, the year from **5 seconds to 6
+hours (360 min)**, so the short end stays fine-grained (one slider step ≈
+0.03–0.04 s at the low end, 1–3 s at the top); the readout auto-formats
+seconds, minutes or hours. The spin axis can be **tilted against the
 orbital axis** (*Axial tilt* slider, 0–45°, shipped default 23.5° — Earth's
 own axial tilt): the tilt
 is applied as a fixed
@@ -228,8 +253,16 @@ orbits, and the year brings **seasons**: each hemisphere leans into the Sun
 on opposite sides of the orbit, shifting where evaporation, melt and snow
 happen. At 0° the classic upright spin is restored exactly. The spin sweeps
 the day/night terminator
-across the surface while the year slowly changes the sun's azimuth; at zero
-tilt the sun's elevation above the horizon stays constant (~22°). The
+across the surface while the year slowly changes the sun's azimuth. The sun
+is a fixed light parked at the **centre of the orbital plane** (at 3.4× the
+ocean radius), so at **zero tilt** the subsolar point rides the equator
+year-round and **both poles receive identical grazing irradiation** — the
+old behavior that permanently favored the northern hemisphere is gone. With
+a non-zero tilt the planet's axis leans against the orbital plane, so the
+sun's latitude over the planet oscillates between **±tilt over one year** —
+real seasons, polar day and polar night. Angles wrap canonically, so huge
+dt steps (tab stalls, calibration) never desynchronize day from year.
+The
 *Time scale* slider scales the whole simulation clock — physics steps AND the
 orbital/spin motion alike — so speeding up time spins the planet faster too.
 Together they
@@ -290,15 +323,16 @@ immediately falling back into its source basin. This is a stylized parcel
 circulation model, not a compressible atmosphere solver. Vapor condenses on
 liquid contact and rains out when cold.
 
-**Evaporation is gated by the *Evaporation point* and grows exponentially
-between the coldest and hottest *eligible* water**: water leaves the sea only
-when heated to 5 % **above** the *Evaporation point* slider (shipped default
-**0.40** → the gate sits at 0.42); every thermal tick scans the eligible
-liquid's Tmin/Tmax, and a surface parcel at temperature T leaves with
-probability `rate · e^{5(τ−1)}` where `τ = 1 − (Tmax−T)/(Tmax−Tmin)` — the
-hottest eligible parcel always has τ = 1, the sun-warmed day side boils off
-briskly while cooler water evaporates far more slowly. The **Sun activity**
-slider scales the rate (and the heating).
+**Evaporation is an absolute exponential law in the water temperature, with
+no gate**: any surface parcel of liquid water above the freezing point (the
+effective melt value, ≥ snow point × 1.05) may leave the sea, with
+per-second probability `intensity · sunActivity · e^{3.5·(T − T_freeze)}`,
+capped at certainty. The *Evaporation intensity* slider (0–100 %, shipped
+default 5 %) is the coefficient of that formula; the old *Evaporation
+point* slider is gone. Water at or below the freezing point is ice and never
+evaporates; water just above it seeps vapor slowly, and the sun-warmed day
+surface boils off briskly. The **Sun activity** slider scales the rate (and
+the heating).
 
 Vapor parcels **collide and repel each other** — overlapping pairs swap
 normal velocity components and get pushed apart with a short repulsion
@@ -347,12 +381,24 @@ redistribution, with the residual dissipated. Momentum is conserved exactly;
 mechanical energy never increases. Rotation also shows as a subtle brightness
 pulse on the parcel sprite (the spin phase), and damps gently in the air.
 
+The **Spin velocity color** checkbox (off by default) replaces every
+particle's class color with its spin angular-velocity vector — R/G/B =
+ω_x/ω_y/ω_z, each component normalized to 0…1 **across all particles in the
+simulation** (global per-component min/max; the degenerate all-equal
+component reads mid-grey). It applies to every type — fluid beads, spray,
+steam, cloud, rain and snow — turning the airborne population into a live
+map of where the evaporation twirl points.
+
 Airborne water sheds heat fast: its ambient is the sky — mild by day,
 near-freezing in shade and after sundown. When it cools below the dew point
 it **condenses**: the droplet sheds its vapor motion entirely (speed drops to
 zero) and free-falls onto the planet, where the existing spray rules take
-over — gravity, terrain contact, beaching into puddles that run downhill to
-the ocean or pool into lakes. Water mass is conserved across all six
+over — gravity, terrain contact, **beaching on the spot**: a raindrop that
+hits a mountain is pulled back onto the *visible* surface and stays there as
+a grid-coupled puddle that creeps downhill (three placement passes — the
+ballistic landing, the advection boundary and the embedded rescue — all park
+on the smooth mesh, and the "sea in the sky" spray-demote gate scales with
+the cell size so beached droplets are never re-bounced as spray). Water mass is conserved across all six
 statuses (fluid / droplet / steam / cloud / rain / snow).
 
 #### Clouds, rain & snow — evaporated-particle substates
@@ -369,9 +415,14 @@ Evaporated particles are a small state machine, evaluated once per frame:
   burn off back to steam when warmed past the cloud point again. Only
   *steam* produces rain — a cloud never rains out; it persists until the sun
   warms it or the sea absorbs it.
-* **rain**: steam colder than the *Rain point temperature* sheds its lift and
-  falls as a water droplet (rendered like spray droplets, landing by the
-  usual spray rules). Rain that cools further freezes.
+* **rain**: steam colder than the *Rain point temperature* — once it has
+  been airborne for a moment (a freshly evaporated parcel gets a lift-off
+  window, so cold-night vapor is visible before it re-condenses) — sheds its
+  lift and its wind speed and falls as a water droplet (rendered like spray
+  droplets, landing by the usual spray rules). Falling rain trades heat with
+  the air it drops through rather than radiating to space like deep water,
+  so it lands liquid unless it genuinely chills below the *Snow point* while
+  falling.
 * **snow**: water at a fluid–air interface (sea/pond surface — deep water
   cannot shed its latent heat to the sky) or rain colder than the *Snow point
   temperature* freezes solid: **static white discs**, the same size as water
@@ -532,6 +583,60 @@ length ∝ averaged speed, color ramping calm blue → white with speed.
 Particles rotation (each droplet carries an angular phase driven by the
 local vorticity) is **enabled by default**.
 
+**Metaball water** (Display checkbox, off by default) is a third way to draw
+the liquid body: every grid-coupled water particle contributes a compact
+radial kernel to a corner field on the solver lattice, and the summed field
+is contoured by the **same marching-tets mesher** as the surface — a classic
+Blinn-style metaball skin that reads as liquid fused out of the particles
+instead of a thin film over them. It replaces both other water-body
+renderings: the isosurface mesh is hidden (like beads mode) and the liquid
+bead circles are suppressed, while spray, vapor, cloud and snow keep drawing
+as sprites. The metaball mesh shares the water surface's **material
+instance**, so color, opacity, clearcoat gloss, alpha pre-boost and the
+animated ripples are always identical to the water itself — the metaball
+skin IS the water.
+
+The **Metaball tension** slider (0–100 %, default 50 %) drives the kernel
+radius between **1.6 and 3.8 particle spacings** while the contour level
+rises with radius^1.5, so the effect is visible but proportionate: low
+tension keeps the skin tight and granular around the particle cloud
+(~115 % of the true water volume), high tension lets neighbours merge into
+fewer, larger, smoother blobs (~2× the water volume — the fused skin reads
+fatter than the thin film of the regular surface). Tension is a display
+property only; physics, droplets and the auto-calibrated surface iso are
+untouched. The field + march costs ≈ 13 ms/frame at Medium 40³
+×3 (~163k particles) and ≈ 1.5 ms at Eco, and is included in auto-detail
+calibration when enabled.
+
+The **Metaball tessellation** slider (0–100 %, default 50 % = ×1.00) sets
+the metaball detail level, independent of tension: the kernel field is
+splatted onto its **own corner lattice** covering the same domain, scaled
+**×0.6–×1.4 per axis** from the solver grid (the readout shows the lattice
+factor). Coarser lattices march far fewer cells — ≈ 7 ms and ×0.4 the
+vertices at ×0.6 on Medium 40³ ×3, vs ≈ 10 ms at ×1.00 — for a blockier
+skin; finer lattices smooth it at real frame cost (≈ 18 ms at ×1.4, ≈ 24 ms
+at the ×1.6 clamp), so raise it only if the budget allows. Kernel radius,
+tension mapping and iso level are lattice-independent, so the skin's shape
+and volume carry over within point-sampling error; on very sparse spray or
+thin streams coarse settings can bead the skin. The pass is included in
+auto-detail calibration at whatever tessellation you have dialed in.
+
+**Metaball material editor** — the metaball skin has its own material,
+editable in the collapsible "Metaball material editor" fold under the
+tessellation slider. Metaball color tints only the blobs: while untouched it
+follows the Water color picker, and the first pick here detaches it
+permanently (the sea keeps the picker hue). Shading switches the skin
+between **Physical** (the water look — clearcoat + animated ripples),
+**Matte** (diffuse) and **Unlit** (flat). Texture layers a procedural shader
+effect onto the picked color — **None, Noise** (multi-octave grain),
+**Caustics** (drifting bright filaments) or **Stripes** (soft diagonal
+bands) — with no image assets and density that stays constant per metre on
+any planet size. Metaball opacity and Metaball glossiness (roughness =
+1 − gloss, clearcoat = gloss) complete the look, starting at the shipped
+water feel (25 % / 85 %). None of these controls touch the regular water
+surface: it keeps its own material, driven by the Water color and Water
+surface opacity sliders.
+
 ### 6. Surface reconstruction
 
 The visible water surface is the iso-surface of a particle density field
@@ -630,6 +735,9 @@ node test/surface.test.js   # marching-tets volume conservation + normals
 node test/quality.test.js   # detail presets + frame-budget policy
 node test/main.test.js      # app loop, UI wiring, Earth-mode knobs
 node test/phase.test.js     # substate machine + particle rotation friction + ice adhesion
+node test/metaball.test.js  # metaball field, tension sweep + display-mode gating
+node test/orbit.test.js     # orbital-plane sun, seasons + planet-motion invariants
+node test/camera.test.js    # orbit camera polar freedom, zoom clamps, pole safety
 node test/scene_fx.test.js  # motion blur, starfield, combined-sprite ordering (headless)
 node test/performance.js    # CPU step + surface benchmark, three presets
 node test/browser.test.js   # optional: local Chrome, real WebGL + screenshots
@@ -695,7 +803,8 @@ your hardware. Surface extraction and rendering are additional costs. A
 deterministic day-origin cohort test also checks transport before
 condensation and eventual rain-out after global nightfall.
 
-Manual presets ship as the default (**Medium — 40³**). **Auto detail —
+Manual presets ship as the default (**Tiny — 22³**; the programmatic boot
+fallback matches it). **Auto detail —
 50 FPS / 25 FPS** measures increasing tiers on your own
 browser, from Eco (18³ / 10k target particles) through Extreme (72³ / 220k).
 Each tier includes terrain, particle simulation, surface reconstruction,

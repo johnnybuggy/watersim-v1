@@ -32,14 +32,25 @@ var params = {
   sunActivity: 0.23,    // drives BOTH solar heating and evaporation
   ceilReflect: 'linear',  // vapor ceiling-bounce probability curve: linear|quadratic|exponential
   atmosphereH: 5.4,
-  yearPeriod: 20,       // minutes for one revolution around the fixed sun
-  spinPeriod: 5,        // minutes for one turn about the planet's axis
+  yearPeriod: 1200,     // seconds for one revolution around the fixed sun (20 min)
+  spinPeriod: 300,      // seconds for one turn about the planet's axis (5 min)
   planetColor: '#654321',
   waterColor: '#2ab0f4',   // default water hue RGB(42,176,244)
   showParticles: true,
   showVectors: false,
   tiltDeg: 23.5,
   waterBeads: true,
+  metaballs: false,     // metaball visualization: water particles fused into a liquid skin
+  metaballTension: 0.5, // tension between particles (kernel reach 1.6..3.8 spacings)
+  metaballTess: 0.5,    // tessellation detail: field-lattice scale ×0.6..×1.4 (0.5 → ×1.0)
+  // Metaball material editor (own material on the metaball skin — the water
+  // surface keeps the water controls). The color follows the water picker
+  // until one is picked here; the scene seeds the skin to the water look.
+  metaballColor: '#2ab0f4',   // skin color (validated hex; mirrors pickWater's default)
+  metaballShading: 'physical',  // physical (water look) | matte | unlit
+  metaballTexture: 'none',      // none | noise | caustic | stripes (procedural shader layers)
+  metaballOpacity: 0.25,        // skin opacity (shipped water default)
+  metaballGloss: 0.85,          // skin glossiness (roughness = 1−g, clearcoat = g)
   motionBlur: 0,        // frame-blend damp 0–0.95 (0 = off — normal MSAA render)
   stars: true,
   starBrightness: 1.25,
@@ -50,8 +61,9 @@ var params = {
   rainT: 0.22,          // steam colder than this rains out (clamped < cloudT)
   snowT: 0.10,          // water/rain colder than this freezes (clamped < rainT)
   iceMeltT: 0.105,      // ice melts back at the melt point (5% above the snow point)
-  evapT: 0.40,          // water evaporates 5% above this vapor point
+  evapIntensity: 0.05,  // evaporation law coefficient: p ∝ I·exp(3.5·(T−T_freeze)) per second
   particleSpin: true,   // particles rotation (on by default)
+  spinColor: false,     // color particles by the spin-velocity vector (off by default)
   stirMode: false
 };
 // Earth-mode climate controller state (btnEarth)
@@ -115,7 +127,7 @@ function buildSolver(resKey) {
     mode: 'sphere', coreR: params.coreR, bumpiness: params.bumpiness,
     sunActivity: params.sunActivity, ceilReflect: params.ceilReflect,
     atmosphereH: params.atmosphereH,
-    meltT: params.iceMeltT, evapT: params.evapT
+    meltT: params.iceMeltT, evapIntensity: params.evapIntensity
   });
   s.resetWater(oceanDepthFor());
   solver = s;
@@ -147,7 +159,7 @@ function earthSyncUI() {
   set('rangeRainT', params.rainT); $('rainTVal').textContent = params.rainT.toFixed(2);
   set('rangeSnowT', params.snowT); $('snowTVal').textContent = params.snowT.toFixed(2);
   set('rangeIceMelt', params.iceMeltT); $('iceMeltVal').textContent = params.iceMeltT.toFixed(3);
-  set('rangeEvapT', params.evapT); $('evapTVal').textContent = params.evapT.toFixed(2);
+  set('rangeEvapI', params.evapIntensity); $('evapIVal').textContent = Math.round(params.evapIntensity * 100) + '%';
 }
 function earthFinish(done) {
   if (!earthCtl) return;
@@ -194,8 +206,8 @@ function earthStep() {
   // (the temperature knobs share the 0…1.2 slider range)
   var dV = earthClamp((tV - c.V) * 1.2, -0.05, 0.05);
   params.sunActivity = earthClamp(params.sunActivity + dV, 0.05, 2);
-  if (dV > 0 && params.sunActivity > 1.9) params.evapT = earthClamp(params.evapT - 0.02, 0.05, 1.2);
-  else if (dV < 0) params.evapT = earthClamp(params.evapT + 0.01, 0.05, 1.2);
+  if (dV > 0 && params.sunActivity > 1.9) params.evapIntensity = earthClamp(params.evapIntensity + 0.02, 0.01, 1);
+  else if (dV < 0) params.evapIntensity = earthClamp(params.evapIntensity - 0.01, 0.01, 1);
   // ice: the freeze point moves inside a narrow band (a runaway high snow
   // point freezes the whole planet); the melt point tracks it (5% above
   // freezing, the solver invariant). Ice can only thaw by WARMING past the
@@ -248,11 +260,40 @@ function targetFPS() {
 }
 // ------------------------------------------------------- temperature chart
 // Particle temperature distribution (bottom-right HUD, beside the stats
-// block): a histogram of solver.pT over its working range with two series —
-// condensed water (pflag 0/1/4/5: liquid, spray, rain, snow) and airborne
-// vapor (pflag 2/3: steam + cloud, drawn amber).
+// block): a histogram of solver.pT over its working range with FIVE series —
+// one grouped column per phase class, split out of the solver's pflag codes
+// (0 = fluid water, 1 = droplet spray, 2 = steam, 3 = cloud, 4 = rain,
+// 5 = snow/frozen):
+//   water  pflag 0/1 — condensed liquid (grid-coupled fluid + ballistic spray)
+//   vapor  pflag 2   — airborne steam
+//   ice    pflag 5   — the solver's frozen-liquid state (snow: frozen in
+//                      place, thaws only past the melt point — the same
+//                      population the Earth-mode census counts as ice)
+//   rain   pflag 4   — falling condensate
+//   cloud  pflag 3   — condensed steam riding the winds
+// Every series bins by temperature exactly like the original water/vapor
+// pair (36 bins over the normalized 0..1.2 scale) and plots the class's
+// per-bin share of the particle population (count / nP) on a LOG10 axis:
+// column height = plotH · (log10(share) + 4) / 4, i.e. four full decades
+// from 10⁰ (full height) down to the 1e-4 floor (baseline) — shares below
+// 1e-4 and empty bins clip to the axis bottom. Decade ticks '10⁰' / '10⁻²'
+// plus a small 'log₁₀' tag label the scale.
 // Redrawn on the 0.3 s stats tick; skips silently when the canvas is absent
 // (headless DOM stubs) so tests without a 2D context stay green.
+var T_BINS = 36, T_MAX = 1.2, T_FLOOR_DEC = 4;      // log10 floor = 1e-4
+// Hoisted histograms + static series table: a redraw only fill()s the bins
+// and repaints — no per-tick allocation.
+var _tW = new Array(T_BINS).fill(0), _tV = new Array(T_BINS).fill(0),
+    _tI = new Array(T_BINS).fill(0), _tR = new Array(T_BINS).fill(0),
+    _tC = new Array(T_BINS).fill(0);
+var T_SERIES = [                       // draw order in a bin = legend order;
+  { label: 'water', h: _tW, bar: 'rgba(96,176,255,0.85)', sw: 'rgba(96,176,255,0.95)' },
+  { label: 'vapor', h: _tV, bar: 'rgba(255,196,110,0.9)', sw: 'rgba(255,196,110,0.95)' },
+  { label: 'ice',   h: _tI, bar: '#ffffff', sw: '#ffffff' },
+  { label: 'rain',  h: _tR, bar: '#1a4a8a', sw: '#1a4a8a' },
+  { label: 'cloud', h: _tC, bar: '#9a9a9a', sw: '#9a9a9a' }
+];                                     // water/vapor keep their colors; ice/rain
+                                       // cloud are white / dark blue / grey
 var _tempCtx = null;
 function drawTempChart() {
   var cv = $('tempChart');
@@ -264,46 +305,69 @@ function drawTempChart() {
   var s = solver;
   if (!s || !s.pT || !s.nP || s.pT.length < s.nP) return;
   var w = cv.width, h = cv.height;
-  var BINS = 36, TMAX = 1.2;
-  var wW = new Array(BINS).fill(0), wV = new Array(BINS).fill(0);
-  var fl = s.pflag, pT = s.pT;
-  for (var p = 0; p < s.nP; p++) {
-    var t = pT[p]; if (!(t >= 0)) t = 0; else if (t > TMAX) t = TMAX;
-    var b = (t * BINS / TMAX) | 0; if (b >= BINS) b = BINS - 1;
-    if (fl && (fl[p] === 2 || fl[p] === 3)) wV[b]++; else wW[b]++;
+  var wW = _tW, wV = _tV, wI = _tI, wR = _tR, wC = _tC;
+  wW.fill(0); wV.fill(0); wI.fill(0); wR.fill(0); wC.fill(0);
+  var fl = s.pflag, pT = s.pT, nP = s.nP;
+  for (var p = 0; p < nP; p++) {
+    var t = pT[p]; if (!(t >= 0)) t = 0; else if (t > T_MAX) t = T_MAX;
+    var b = (t * T_BINS / T_MAX) | 0; if (b >= T_BINS) b = T_BINS - 1;
+    var f = fl ? fl[p] : 0;
+    if (f === 2) wV[b]++;            // steam
+    else if (f === 3) wC[b]++;       // cloud
+    else if (f === 4) wR[b]++;       // rain
+    else if (f === 5) wI[b]++;       // snow = frozen liquid (ice)
+    else wW[b]++;                    // 0 fluid + 1 spray = condensed water
   }
-  var mx = 1;
-  for (var i = 0; i < BINS; i++) { if (wW[i] > mx) mx = wW[i]; if (wV[i] > mx) mx = wV[i]; }
-  var x0 = 8, x1 = w - 8, yBase = h - 16, yTop = 20;
-  var bw = (x1 - x0) / BINS;
+  var x0 = 36, x1 = w - 8, yBase = h - 16, yTop = 20;
+  var plotH = yBase - yTop, yMid = yTop + plotH * 0.5;
+  var bw = (x1 - x0) / T_BINS;
+  var slot = bw / T_SERIES.length;               // five grouped columns per bin
+  var barW = Math.max(1, slot * 0.8);
   var ctx = _tempCtx;
   ctx.clearRect(0, 0, w, h);
-  // legend
+  // legend: five short labels with 7 px swatches, fitted to the 238 px width
   ctx.font = '10px system-ui, sans-serif';
-  ctx.fillStyle = 'rgba(96,176,255,0.95)'; ctx.fillRect(x0, 7, 8, 8);
-  ctx.fillStyle = '#b9d4e6'; ctx.fillText('water', x0 + 11, 14);
-  ctx.fillStyle = 'rgba(255,196,110,0.95)'; ctx.fillRect(x0 + 58, 7, 8, 8);
-  ctx.fillStyle = '#b9d4e6'; ctx.fillText('vapor', x0 + 69, 14);
-  // baseline
+  var lx = 4;
+  for (var i = 0; i < T_SERIES.length; i++) {
+    ctx.fillStyle = T_SERIES[i].sw;
+    ctx.fillRect(lx, 7, 7, 8);
+    ctx.fillStyle = '#b9d4e6';
+    ctx.fillText(T_SERIES[i].label, lx + 10, 14);
+    lx += 10 + T_SERIES[i].label.length * 6 + 5;
+  }
+  // log10 y axis: decade ticks — 10⁰ at the top, 10⁻² midway, the baseline
+  // is the 1e-4 floor — plus the scale tag in the left margin
+  ctx.fillStyle = '#6f8ba0';
+  ctx.fillText('10\u2070', x0 - 5 - 3 * 6, yTop + 4);
+  ctx.fillText('10\u207B\u00B2', x0 - 5 - 4 * 6, yMid + 4);
+  ctx.fillText('log\u2081\u2080', 4, yBase - plotH * 0.25 + 4);
   ctx.strokeStyle = 'rgba(160,190,210,0.35)';
+  ctx.beginPath();
+  ctx.moveTo(x0 - 5, yTop + 0.5); ctx.lineTo(x0, yTop + 0.5);
+  ctx.moveTo(x0 - 5, yMid + 0.5); ctx.lineTo(x0, yMid + 0.5);
+  ctx.stroke();
+  // baseline
   ctx.beginPath(); ctx.moveTo(x0, yBase + 0.5); ctx.lineTo(x1, yBase + 0.5); ctx.stroke();
-  // paired bars: water left half, vapor right half of each bin
-  for (i = 0; i < BINS; i++) {
-    if (wW[i]) {
-      var hh = Math.round((yBase - yTop) * wW[i] / mx);
-      ctx.fillStyle = 'rgba(96,176,255,0.85)';
-      ctx.fillRect(x0 + i * bw, yBase - hh, Math.max(1, bw * 0.48), hh);
-    }
-    if (wV[i]) {
-      var hv = Math.round((yBase - yTop) * wV[i] / mx);
-      ctx.fillStyle = 'rgba(255,196,110,0.9)';
-      ctx.fillRect(x0 + i * bw + bw * 0.5, yBase - hv, Math.max(1, bw * 0.42), hv);
+  // grouped columns: per temperature bin, one column per class, height on
+  // the log10 share axis (decades above the 1e-4 floor; clipped below it)
+  for (i = 0; i < T_BINS; i++) {
+    var xs = x0 + i * bw;
+    for (var k = 0; k < T_SERIES.length; k++) {
+      var c = T_SERIES[k].h[i];
+      if (!c) continue;
+      var dec = Math.log10(c / nP) + T_FLOOR_DEC;
+      if (dec <= 0) continue;                    // below 1e-4: clips to the bottom
+      if (dec > T_FLOOR_DEC) dec = T_FLOOR_DEC;
+      var hh = Math.round(plotH * dec / T_FLOOR_DEC);
+      if (hh <= 0) continue;
+      ctx.fillStyle = T_SERIES[k].bar;
+      ctx.fillRect(xs + k * slot, yBase - hh, barW, hh);
     }
   }
   // axis labels (normalized temperature, matching the solver's 0..1.15 scale)
   ctx.fillStyle = '#6f8ba0';
   ctx.fillText('0', x0 - 2, h - 4);
-  var lbl = String(TMAX);
+  var lbl = String(T_MAX);
   ctx.fillText(lbl, x1 - lbl.length * 6, h - 4);
   ctx.fillText('particle temperature', x1 - 118, h - 4);
   // phase-change threshold marks: cloud / rain / snow points on the same
@@ -319,8 +383,8 @@ function drawTempChart() {
     marks[1][0] = effR; marks[2][0] = effS;
     for (i = 0; i < marks.length; i++) {
       var tM = marks[i][0];
-      if (!(tM > 0) || tM > TMAX) continue;
-      var xm = Math.round(x0 + tM / TMAX * (x1 - x0)) + 0.5;
+      if (!(tM > 0) || tM > T_MAX) continue;
+      var xm = Math.round(x0 + tM / T_MAX * (x1 - x0)) + 0.5;
       ctx.strokeStyle = marks[i][2];
       ctx.globalAlpha = 0.85;
       ctx.beginPath(); ctx.moveTo(xm, yBase - 1); ctx.lineTo(xm, yBase - 9); ctx.stroke();
@@ -362,6 +426,21 @@ function updateSurface() {
   solver.splatDensity();
   var mesh = MarchingTetrahedra.build(solver.dens, solver.nx, solver.ny, solver.nz, solver.dx, params.iso);
   scene.updateWater(mesh.pos, mesh.nrm, mesh.count);
+  surfaceMs = ema(surfaceMs, performance.now() - start, 0.1);
+}
+// Metaball display pass: Blinn field over the water particles (radius driven
+// by the tension slider) contoured with the same marching-tets mesher; the
+// skin is drawn with the water's own material by the scene.
+// The tessellation slider scales the metaball field's OWN corner lattice
+// around the solver lattice (×0.6 coarse … ×1.4 fine); the shipped default
+// ×1.0 keeps the lattice the metaballs shipped with. The slider stores the
+// raw 0..1 position — the factor is computed here (and in the readout) from
+// this one mapping.
+function tessFactor(pos) { return 0.6 + 0.8 * pos; }
+function updateMetaballSurface() {
+  var start = performance.now();
+  var mesh = Metaballs.build(solver, params.metaballTension, tessFactor(params.metaballTess));
+  scene.updateMetaballs(mesh.pos, mesh.nrm, mesh.count);
   surfaceMs = ema(surfaceMs, performance.now() - start, 0.1);
 }
 // Calibration is explicit and precedes the new simulation. Never replace an
@@ -467,6 +546,9 @@ function calibrate(fps) {
     advanceCelestial(params.timeScale / testFPS);
     solver.step(params.timeScale / testFPS);
     updateSurface();
+    // measure the metaball display pass too when it is enabled — it replaces
+    // the beads/surface work in real frames, so calibration must budget it
+    if (params.metaballs) updateMetaballSurface();
     scene.updateParticles(solver, params.showParticles);
     scene.syncBalls(solver.balls);
     scene.render(1 / testFPS);
@@ -493,7 +575,9 @@ function calibrate(fps) {
 function init() {
   var container = $('viewport');
   // Auto mode starts with the cheapest placeholder; measured tiers replace it.
-  buildSolver(targetFPS() ? 'eco' : ($('selRes').value || 'medium'));
+  // The fallback must match the shipped #selRes default (Tiny — 22³) so a
+  // programmatic boot without a DOM lands on the same tier as the page.
+  buildSolver(targetFPS() ? 'eco' : ($('selRes').value || 'tiny'));
   scene = new WaterScene(container, solver.W, solver.H, solver.D, worldOpts());
   scene.setWaterColor(params.waterColor);
   scene.setWaterOpacity(params.waterOpacity);
@@ -510,6 +594,7 @@ function init() {
   // water-beads display mode defaults ON (checkbox state synced in bindUI):
   // the liquid body renders exclusively as glossy ball particles
   scene.setBeadsMode(params.waterBeads);
+  scene.setMetaballs(params.metaballs);
   scene.setMotionBlur(params.motionBlur);
   scene.setStars(params.stars, params.starBrightness);
 
@@ -530,6 +615,7 @@ function init() {
 // working in real units.
 function bindRange(id, outId, get, set, fmt, map) {
   var el = $(id);
+  if (!el) return;   // headless fake DOMs (smoke harness) may omit newer controls
   var to = map ? map.to : null, from = map ? map.from : null;
   el.value = to ? to(get()) : get();
   var out = $(outId);
@@ -562,6 +648,29 @@ function bindUI() {
   if (btnClose) btnClose.addEventListener('click', function () { setPanel(false); });
   setPanel(false);   // collapsed by default (mobile-friendly)
   renderBackend();   // badge is correct from the first frame (no 0.3 s wait)
+
+  // ---- tabbed pages: the control panel is one big centered pane split into
+  // five logical groups; every group keeps its own page <div> (id page<Key>)
+  // under a tab button (id tab<Key>). Switching is a classList toggle only —
+  // no element is created or moved at runtime, so headless DOM stubs stay
+  // green (the smoke harness lists the ids explicitly; main.test auto-stubs
+  // every index.html id).
+  var TABS = ['Physics', 'Display', 'Planet', 'Orbit', 'Climate'];
+  var activeTab = 'Physics';
+  function showTab(name) {
+    activeTab = name;
+    for (var i = 0; i < TABS.length; i++) {
+      var key = TABS[i];
+      var tab = $('tab' + key), page = $('page' + key);
+      if (tab) tab.classList.toggle('active', key === name);
+      if (page) page.classList.toggle('active', key === name);
+    }
+  }
+  TABS.forEach(function (key) {
+    var tab = $('tab' + key);
+    if (tab) tab.addEventListener('click', function () { showTab(key); });
+  });
+  showTab(activeTab);
 
   $('btnPause').addEventListener('click', function () {
     paused = !paused;
@@ -649,8 +758,9 @@ function bindUI() {
     function (v) { params.snowT = v; }, function (v) { return v.toFixed(2); });
   bindRange('rangeIceMelt', 'iceMeltVal', function () { return params.iceMeltT; },
     function (v) { params.iceMeltT = v; }, function (v) { return v.toFixed(3); });
-  bindRange('rangeEvapT', 'evapTVal', function () { return params.evapT; },
-    function (v) { params.evapT = v; }, function (v) { return v.toFixed(2); });
+  bindRange('rangeEvapI', 'evapIVal', function () { return params.evapIntensity; },
+    function (v) { params.evapIntensity = v; },
+    function (v) { return Math.round(v * 100) + '%'; });
 
   bindRange('rangeCore', 'coreVal', function () { return params.coreR; },
     function (v) { params.coreR = v; }, function (v) { return v.toFixed(2) + ' m'; });
@@ -668,11 +778,26 @@ function bindUI() {
     function (v) { params.sunActivity = v; solver.sunActivity = v; }, function (v) { return v.toFixed(2); });
   bindRange('rangeAtm', 'atmVal', function () { return params.atmosphereH; },
     function (v) { params.atmosphereH = v; solver.atmosphereH = v; scene.setAtmosphereHeight(v); }, function (v) { return v.toFixed(2) + ' m'; });
-  // celestial periods: sliders are in minutes, the scene works in seconds
+  // celestial periods: LOGARITHMIC slider positions (0…1) over a wide
+  // physical span — day 5 s … 30 min, year 5 s … 360 min — so the short end
+  // stays fine-grained (a linear slider over 360× would be unusable).
+  // params store SECONDS; the scene consumes seconds directly.
+  var logLo = Math.log(5), spinSpan = Math.log(1800) - logLo, yearSpan = Math.log(21600) - logLo;
+  function fmtPeriod(v) {
+    if (!(v > 0)) return '\u2014';
+    if (v < 60) return v.toFixed(v < 10 ? 1 : 0) + ' s';
+    if (v < 600) return (v / 60).toFixed(2) + ' min';
+    if (v < 3600) return Math.round(v / 60) + ' min';
+    return (v / 3600).toFixed(2) + ' h';
+  }
   bindRange('rangeYear', 'yearVal', function () { return params.yearPeriod; },
-    function (v) { params.yearPeriod = v; scene.setYearPeriod(v * 60); }, function (v) { return v.toFixed(1) + ' min'; });
+    function (v) { params.yearPeriod = v; scene.setYearPeriod(v); }, fmtPeriod,
+    { to: function (s) { return Math.max(0, Math.min(1, (Math.log(s) - logLo) / yearSpan)); },
+      from: function (p) { return Math.exp(logLo + p * yearSpan); } });
   bindRange('rangeSpin', 'spinVal', function () { return params.spinPeriod; },
-    function (v) { params.spinPeriod = v; scene.setSpinPeriod(v * 60); }, function (v) { return v.toFixed(1) + ' min'; });
+    function (v) { params.spinPeriod = v; scene.setSpinPeriod(v); }, fmtPeriod,
+    { to: function (s) { return Math.max(0, Math.min(1, (Math.log(s) - logLo) / spinSpan)); },
+      from: function (p) { return Math.exp(logLo + p * spinSpan); } });
   bindRange('rangeTilt', 'tiltVal', function () { return params.tiltDeg; },
     function (v) { params.tiltDeg = v; scene.setTilt(v); }, function (v) { return v.toFixed(1) + '\u00B0'; });
 
@@ -711,6 +836,7 @@ function bindUI() {
 
   $('chkParticles').addEventListener('change', function () { params.showParticles = this.checked; });
   $('chkSpin').addEventListener('change', function () { params.particleSpin = this.checked; });
+  $('chkSpinColor').addEventListener('change', function () { params.spinColor = this.checked; });
 
   bindRange('rangeBlur', 'blurVal', function () { return params.motionBlur; },
     function (v) {
@@ -746,6 +872,82 @@ function bindUI() {
     scene.setBeadsMode(params.waterBeads);
     dirty = true;
   });
+  // metaball visualization: the liquid body renders as the particles' fused
+  // metaball skin (Blinn field + marching tets), drawn with the skin's own
+  // material (seeded to match the water; editable in the material editor
+  // below). The tension slider drives the metaball kernel radius: low tension
+  // keeps particles as separate beads, high tension fuses them into liquid blobs.
+  var chkMetaballs = $('chkMetaballs');
+  params.metaballs = chkMetaballs.checked;
+  chkMetaballs.addEventListener('change', function () {
+    params.metaballs = this.checked;
+    scene.setMetaballs(params.metaballs);
+    dirty = true;
+  });
+  bindRange('rangeMbla', 'mblaVal', function () { return params.metaballTension; },
+    function (v) { params.metaballTension = v; dirty = true; },
+    function (v) { return Math.round(v * 100) + '%'; });
+  // Metaball tessellation detail: the readout shows the resulting lattice
+  // FACTOR (×0.60–×1.40), not the raw slider position — default ×1.00.
+  bindRange('rangeMblaTess', 'tessVal', function () { return params.metaballTess; },
+    function (v) { params.metaballTess = v; dirty = true; },
+    function (v) { return '\u00D7' + tessFactor(v).toFixed(2); });
+  // Metaball material editor: five controls on the skin's OWN material
+  // (scene.metaballMat) — the regular water surface (waterMat) never sees
+  // these calls. Material-only edits: no `dirty` needed (no mesh rebuild).
+  // The color follows the water picker until a color is picked here (the
+  // scene's sync rule — see setMetaballMaterial / setWaterColor in scene.js).
+  // Stub DOMs feed bogus values ('0', unknown options): every handler
+  // validates and falls back to the shipped default instead of crashing.
+  function mblaShade(v) {   // whitelist: physical (water look) | matte | unlit
+    return (v === 'matte' || v === 'unlit') ? v : 'physical';
+  }
+  function mblaTex(v) {     // whitelist: procedural shader-layer types
+    return (v === 'noise' || v === 'caustic' || v === 'stripes') ? v : 'none';
+  }
+  var mblaColorRe = /^#[0-9a-fA-F]{6}$/;
+  var pickMbla = $('pickMbla');
+  if (pickMbla) {
+    if (!mblaColorRe.test(params.metaballColor)) params.metaballColor = params.waterColor;
+    pickMbla.value = params.metaballColor;
+    pickMbla.addEventListener('input', function () {
+      if (!mblaColorRe.test(this.value)) return;   // ignore malformed picker values
+      params.metaballColor = this.value;
+      scene.setMetaballMaterial({ color: params.metaballColor });
+    });
+  }
+  var selMblaShade = $('selMblaShade');
+  if (selMblaShade) {
+    params.metaballShading = mblaShade(params.metaballShading);
+    selMblaShade.value = params.metaballShading;
+    selMblaShade.addEventListener('change', function () {
+      params.metaballShading = mblaShade(this.value);
+      selMblaShade.value = params.metaballShading;   // keep the widget on the sanitized value
+      scene.setMetaballMaterial({ shading: params.metaballShading });
+    });
+  }
+  var selMblaTex = $('selMblaTex');
+  if (selMblaTex) {
+    params.metaballTexture = mblaTex(params.metaballTexture);
+    selMblaTex.value = params.metaballTexture;
+    selMblaTex.addEventListener('change', function () {
+      params.metaballTexture = mblaTex(this.value);
+      selMblaTex.value = params.metaballTexture;
+      scene.setMetaballMaterial({ texture: params.metaballTexture });
+    });
+  }
+  bindRange('rangeMblaOpa', 'mblaOpaVal', function () { return params.metaballOpacity; },
+    function (v) {
+      params.metaballOpacity = isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.25;
+      scene.setMetaballMaterial({ opacity: params.metaballOpacity });
+    },
+    function (v) { return Math.round(v * 100) + '%'; });
+  bindRange('rangeMblaGloss', 'mblaGlaVal', function () { return params.metaballGloss; },
+    function (v) {
+      params.metaballGloss = isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.85;
+      scene.setMetaballMaterial({ gloss: params.metaballGloss });
+    },
+    function (v) { return Math.round(v * 100) + '%'; });
   // vapor ceiling-bounce probability curve (linear / quadratic / exponential)
   $('selCeil').value = params.ceilReflect;
   $('selCeil').addEventListener('change', function () {
@@ -892,8 +1094,9 @@ function frame(now) {
     solver.rainT = params.rainT;
     solver.snowT = params.snowT;
     solver.meltT = params.iceMeltT;
-    solver.evapT = params.evapT;
+    solver.evapIntensity = params.evapIntensity;
     solver.spinOn = params.particleSpin;
+    scene.spinColor = params.spinColor;
 
     var t0 = performance.now();
     solver.step(dt * params.timeScale);
@@ -915,8 +1118,11 @@ function frame(now) {
     lastShowParticles = params.showParticles;
   }
   if (dirty) {
-    // beads mode skips the marching-tetrahedra pass entirely (no surface to build)
-    if (!params.waterBeads) updateSurface();
+    // metaball mode replaces the water body: the liquid renders as the
+    // particles' fused metaball skin. Otherwise beads mode skips the
+    // marching-tetrahedra pass entirely (no surface to build).
+    if (params.metaballs) updateMetaballSurface();
+    else if (!params.waterBeads) updateSurface();
     dirty = false;
   }
   // water velocity vectors (Display checkbox) — only while enabled

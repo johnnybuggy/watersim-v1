@@ -459,6 +459,47 @@ console.log('test: bumpiness 0 gives a smooth voxel sphere');
     'nP=' + spS.nP + ', inRock=' + inRk + ', v_rms=' + Math.sqrt(vr2 / spS.nP).toFixed(4) + ' m/s');
 })();
 
+console.log('test: rain landing on a mountain beaches in place (no bounce, no teleport to the sea)');
+(function () {
+  // fresh world with real mountains; find the tallest peak deterministically
+  var COREM = 1.5, ODEPM = 0.45;
+  var spM = new FluidSolver({ nx: 44, ny: 44, nz: 44, dx: 2 * (COREM + ODEPM + 0.6) / 44,
+    targetParticles: 12000, mode: 'sphere', coreR: COREM, bumpiness: 1, sunActivity: 0.6 });
+  var dxM = spM.dx;
+  spM.pressureIters = 20;
+  spM.resetWater(ODEPM);
+  var peak = null, peakH = -1;
+  for (var mi = 0; mi < 800; mi++) {
+    var ma = mi * 2.399963, mu = 1 - 2 * (mi + 0.5) / 800;
+    var msq = Math.sqrt(1 - mu * mu);
+    var mdx = msq * Math.cos(ma), mdy = mu, mdz = msq * Math.sin(ma);
+    var mRt = spM.terrainRadiusAt(spM.cx + mdx * 2.2, spM.cy + mdy * 2.2, spM.cz + mdz * 2.2);
+    if (mRt - spM.oceanR > peakH) { peakH = mRt - spM.oceanR; peak = [mdx, mdy, mdz]; }
+  }
+  check('mountain world has real peaks above sea level', peakH > 0.15, 'peak +' + peakH.toFixed(3));
+  var pR = spM.nP - 1;                       // dedicate the last particle to the raindrop
+  var rStart = spM.oceanR + peakH + 0.5;
+  spM.pflag[pR] = 4; spM.pT[pR] = 0.15;      // cold rain (rains out ≤ 0.22, evap gate 0.42)
+  spM.px[pR] = spM.cx + peak[0] * rStart;
+  spM.py[pR] = spM.cy + peak[1] * rStart;
+  spM.pz[pR] = spM.cz + peak[2] * rStart;
+  spM.pvx[pR] = 0; spM.pvy[pR] = 0; spM.pvz[pR] = 0;
+  for (var ms = 0; ms < 90; ms++) spM.step(1 / 60);
+  var mEx = spM.px[pR] - spM.cx, mEy = spM.py[pR] - spM.cy, mEz = spM.pz[pR] - spM.cz;
+  var mEr = Math.sqrt(mEx * mEx + mEy * mEy + mEz * mEz);
+  var mRt = spM.terrainRadiusAt(spM.px[pR], spM.py[pR], spM.pz[pR]);
+  var mAlt = mEr - mRt;
+  // angular drift along the surface: stayed on its peak instead of sliding
+  // to the nearest water body (arc length, world units)
+  var mDot = (mEx * peak[0] + mEy * peak[1] + mEz * peak[2]) / mEr;
+  var mArc = Math.acos(mDot > 1 ? 1 : mDot) * spM.oceanR;
+  check('raindrop beached as fluid on its mountain (fl 0, at the surface, dry of rock)',
+    spM.pflag[pR] === 0 && mAlt > -0.5 * dxM && mAlt < 0.3 && !spM._rockCellAt(spM.px[pR], spM.py[pR], spM.pz[pR]),
+    'fl=' + spM.pflag[pR] + ' alt=' + mAlt.toFixed(3) + ' inRock=' + spM._rockCellAt(spM.px[pR], spM.py[pR], spM.pz[pR]));
+  check('beached raindrop did NOT migrate to the sea', mArc < 1.0,
+    'arc drift ' + mArc.toFixed(3) + ' world units');
+})();
+
 console.log('test: evaporation, condensation & the atmosphere');
 (function () {
   var spE = new FluidSolver({ nx: 32, ny: 32, nz: 32, dx: 2 * (R2S + 0.6) / 32,
@@ -531,7 +572,7 @@ console.log('test: evaporation, condensation & the atmosphere');
   spE.px[pc2] = spE.cx + dd[0] / dn * (spE.oceanR + 0.5);
   spE.py[pc2] = spE.cy + dd[1] / dn * (spE.oceanR + 0.5);
   spE.pz[pc2] = spE.cz + dd[2] / dn * (spE.oceanR + 0.5);
-  spE.pflag[pc2] = 2; spE.pT[pc2] = 0.15; spE.pAir[pc2] = 0;   // cold: rains out (rain point 0.22, snow point 0.10)
+  spE.pflag[pc2] = 2; spE.pT[pc2] = 0.15; spE.pAir[pc2] = 1;   // cold mature parcel rains out (rain point 0.22, snow point 0.10; the 0.4 s lift window is already served)
   spE.pvx[pc2] = 0.9; spE.pvy[pc2] = 0.9; spE.pvz[pc2] = 0.9;
   spE.step(1 / 60);
   var spd2 = Math.sqrt(spE.pvx[pc2] * spE.pvx[pc2] + spE.pvy[pc2] * spE.pvy[pc2] + spE.pvz[pc2] * spE.pvz[pc2]);

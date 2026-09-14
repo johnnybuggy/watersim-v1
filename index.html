@@ -47,158 +47,203 @@
   </header>
 
   <button id="panelToggle" title="Show / hide the control panel (Tab)" aria-expanded="false">&#9776;</button>
+
+  <!-- Control panel: one big centered pane, five tabbed setting groups.
+       Every existing element id is preserved; tabs are #tab<Key> buttons and
+       pages are #page<Key> divs (main.js toggles .active). -->
   <aside id="panel" class="collapsed">
-    <button id="panelClose" class="panelX" title="Close panel">&times;</button>
-    <h2>Simulation</h2>
-    <div class="row btns">
-      <button id="btnPause">&#9203; Pause</button>
-      <button id="btnReset">&#8635; Reset water</button>
-      <button id="btnEarth" title="Slowly tune sun activity and phase thresholds until the planet settles into a temperate liquid-water climate (liquid : ice : vapor &asymp; 100 : 10 : 1), then stop">&#127758; Earth mode</button>
+    <header id="panelHead">
+      <h2>Simulation</h2>
+      <nav id="panelTabs">
+        <button id="tabPhysics" class="tabbtn active">Physics</button>
+        <button id="tabDisplay" class="tabbtn">Display</button>
+        <button id="tabPlanet" class="tabbtn">Planet</button>
+        <button id="tabOrbit" class="tabbtn">Orbit</button>
+        <button id="tabClimate" class="tabbtn">Climate</button>
+      </nav>
+      <button id="panelClose" class="panelX" title="Close panel">&times;</button>
+    </header>
+
+    <!-- global actions stay visible on every tab -->
+    <div id="panelActions">
+      <div class="row btns">
+        <button id="btnPause">&#9203; Pause</button>
+        <button id="btnReset">&#8635; Reset water</button>
+        <button id="btnEarth" title="Slowly tune sun activity and phase thresholds until the planet settles into a temperate liquid-water climate (liquid : ice : vapor &asymp; 100 : 10 : 1), then stop">&#127758; Earth mode</button>
+        <button id="btnClearBalls">&#10006; Clear</button>
+      </div>
     </div>
-    <div class="row btns">
-      <button id="btnClearBalls">&#10006; Clear</button>
+
+    <div id="panelBody">
+
+      <div id="pagePhysics" class="tabpage active">
+        <label class="slider"><span>Gravity <output id="gravityVal"></output></span>
+          <input type="range" id="rangeGravity" min="0" max="25" step="0.01" value="20"></label>
+        <label class="slider"><span>Viscosity &nu; <output id="viscVal"></output></span>
+          <input type="range" id="rangeVisc" min="0" max="0.02" step="0.0001" value="0.0005"></label>
+        <label class="slider"><span>PIC blend (smoothing) <output id="picVal"></output></span>
+          <input type="range" id="rangePic" min="0" max="0.3" step="0.01" value="0.15"></label>
+        <label class="slider"><span>Pressure iterations <output id="iterVal"></output></span>
+          <input type="range" id="rangeIters" min="10" max="120" step="5" value="20"></label>
+        <label class="slider"><span>Min substeps <output id="subVal"></output></span>
+          <input type="range" id="rangeSubsteps" min="1" max="4" step="1" value="1"></label>
+        <label class="slider"><span>Time scale <output id="timeVal"></output></span>
+          <input type="range" id="rangeTime" min="0.1" max="2" step="0.05" value="1"></label>
+        <label class="slider"><span>Surface threshold <output id="isoVal"></output></span>
+          <input type="range" id="rangeIso" min="0.2" max="3" step="0.01" value="1.8"></label>
+        <div class="wide">
+          <label class="check"><span>Resolution
+            <select id="selRes">
+              <option value="auto50">Auto detail &mdash; 50 FPS target</option>
+              <option value="auto25">Auto detail &mdash; 25 FPS target</option>
+              <option value="eco">Eco &mdash; 18&sup3;</option>
+              <option value="tiny" selected>Tiny &mdash; 22&sup3;</option>
+              <option value="balanced">Balanced &mdash; 26&sup3;</option>
+              <option value="low">Low &mdash; 30&sup3;</option>
+              <option value="medium">Medium &mdash; 40&sup3;</option>
+              <option value="high">High &mdash; 50&sup3;</option>
+              <option value="ultra">Ultra &mdash; 62&sup3;</option>
+              <option value="extreme">Extreme &mdash; 72&sup3;</option>
+            </select></span></label>
+          <button id="btnCalibrate">Recalibrate target (refills ocean)</button>
+          <details class="helpfold">
+            <summary>&#9432; About auto detail</summary>
+            <p class="help">Auto tests increasing grid, particle and rendering detail with a 20% frame-budget reserve. The highest passing tier stays fixed; render scale adapts without resetting water. Targets are not guarantees. Recalibrate after changing physics or window size.</p>
+          </details>
+        </div>
+      </div>
+
+      <div id="pageDisplay" class="tabpage">
+        <label class="slider"><span>Water surface opacity <output id="wOpaVal"></output></span>
+          <input type="range" id="rangeWOpa" min="0.15" max="0.95" step="0.01" value="0.25"></label>
+        <label class="slider"><span>Water color &mdash; surface &amp; droplets</span>
+          <input type="color" id="pickWater" value="#2ab0f4" style="width:100%;height:26px;cursor:pointer;background:none;border:none;padding:0"></label>
+        <!-- nonlinear track (mapped in main.js): bottom half = 0&ndash;0.1 in 0.02% steps,
+             top half = 0.1&ndash;1; value below is the slider POSITION for the 0.5 default -->
+        <label class="slider"><span>Spray &amp; atmosphere opacity <output id="pOpaVal"></output></span>
+          <input type="range" id="rangePOpa" min="0" max="1" step="0.001" value="0.722"></label>
+        <label class="check"><input type="checkbox" id="chkParticles" checked> Spray particles</label>
+        <label class="check"><input type="checkbox" id="chkSpin" checked> Particles rotation</label>
+        <label class="check"><input type="checkbox" id="chkSpinColor"> Spin velocity color &mdash; R/G/B = normalized &omega;<sub>x</sub>/&omega;<sub>y</sub>/&omega;<sub>z</sub> across all particles</label>
+        <label class="check"><input type="checkbox" id="chkBeads" checked> Water beads &mdash; glossy ball particles, no surface</label>
+        <label class="check"><input type="checkbox" id="chkMetaballs"> Metaball water &mdash; fuse particles into liquid blobs</label>
+        <label class="slider"><span>Metaball tension <output id="mblaVal"></output></span>
+          <input type="range" id="rangeMbla" min="0" max="1" step="0.01" value="0.5"></label>
+        <label class="slider"><span>Metaball tessellation <output id="tessVal"></output></span>
+          <input type="range" id="rangeMblaTess" min="0" max="1" step="0.01" value="0.5"></label>
+        <!-- Metaball material editor: restyles the metaball skin's OWN material
+             (metaballMat) — the regular water surface keeps the water controls.
+             The color follows the water picker until a color is picked here. -->
+        <details id="mblaEditorFold" class="fold wide">
+          <summary>Metaball material editor</summary>
+          <label class="slider"><span>Metaball color</span>
+            <input type="color" id="pickMbla" value="#2ab0f4" style="width:100%;height:26px;cursor:pointer;background:none;border:none;padding:0"></label>
+          <label class="check"><span>Shading
+            <select id="selMblaShade">
+              <option value="physical" selected>Physical (water look)</option>
+              <option value="matte">Matte (diffuse)</option>
+              <option value="unlit">Unlit (flat)</option>
+            </select></span></label>
+          <label class="check"><span>Texture
+            <select id="selMblaTex">
+              <option value="none" selected>None</option>
+              <option value="noise">Noise</option>
+              <option value="caustic">Caustics</option>
+              <option value="stripes">Stripes</option>
+            </select></span></label>
+          <label class="slider"><span>Metaball opacity <output id="mblaOpaVal"></output></span>
+            <input type="range" id="rangeMblaOpa" min="0" max="1" step="0.01" value="0.25"></label>
+          <label class="slider"><span>Metaball glossiness <output id="mblaGlaVal"></output></span>
+            <input type="range" id="rangeMblaGloss" min="0" max="1" step="0.01" value="0.85"></label>
+        </details>
+        <label class="check"><input type="checkbox" id="chkVectors"> Water velocity vectors (direction &amp; speed)</label>
+        <label class="slider"><span>Motion blur <output id="blurVal"></output></span>
+          <input type="range" id="rangeBlur" min="0" max="0.95" step="0.05" value="0"></label>
+        <label class="check"><input type="checkbox" id="chkStars" checked> Stars &mdash; background starfield</label>
+        <label class="slider"><span>Star brightness <output id="starVal"></output></span>
+          <input type="range" id="rangeStars" min="0.2" max="2" step="0.1" value="1"></label>
+      </div>
+
+      <div id="pagePlanet" class="tabpage">
+        <details class="helpfold wide">
+          <summary>&#9432; About planet size</summary>
+          <p class="help">Radius sizes the rocky globe (0.5&ndash;25 m — sea level, terrain relief, gravity, balls, camera and sky all scale with it, so every size behaves like the default world); ocean volume scales how much water fills it (particle count &times;0.1&ndash;&times;50 of the active detail preset); bumpiness 0 gives a smooth voxel ball. Applies on release.</p>
+        </details>
+        <label class="slider"><span>Planet radius <output id="coreVal"></output></span>
+          <input type="range" id="rangeCore" min="0.5" max="25" step="0.05" value="11"></label>
+        <label class="slider"><span>Ocean volume <output id="oceanVVal"></output></span>
+          <input type="range" id="rangeOceanV" min="0.1" max="50" step="0.1" value="3"></label>
+        <label class="slider"><span>Planet bumpiness <output id="bumpVal"></output></span>
+          <input type="range" id="rangeBump" min="0" max="2" step="0.05" value="0.15"></label>
+        <label class="slider"><span>Planet color &mdash; gouraud voxel terrain</span>
+          <input type="color" id="pickPlanet" value="#654321" style="width:100%;height:26px;cursor:pointer;background:none;border:none;padding:0"></label>
+        <label class="slider"><span>Heat conductivity <output id="heatKVal"></output></span>
+          <input type="range" id="rangeHeatK" min="0" max="2" step="0.05" value="1.2"></label>
+      </div>
+
+      <div id="pageOrbit" class="tabpage">
+        <details class="helpfold wide">
+          <summary>&#9432; About orbit, day/night &amp; seasons</summary>
+          <p class="help">The Sun is fixed; the planet revolves around it (one &ldquo;year&rdquo;) and spins about its vertical axis (one &ldquo;day&rdquo; &mdash; the day/night cycle). The spin axis can be tilted against the orbit (axial tilt &mdash; the tilted axis keeps its direction in space, so the year brings seasons: each hemisphere leans toward the Sun on opposite sides of the orbit). Shorter period = faster motion.</p>
+        </details>
+        <label class="slider"><span>Year &mdash; orbit around the Sun <output id="yearVal"></output></span>
+          <input type="range" id="rangeYear" min="0" max="1" step="0.001" value="0.655"></label>
+        <label class="slider"><span>Day &mdash; spin about its axis <output id="spinVal"></output></span>
+          <input type="range" id="rangeSpin" min="0" max="1" step="0.001" value="0.696"></label>
+        <label class="slider"><span>Axial tilt &mdash; spin axis vs orbit <output id="tiltVal"></output></span>
+          <input type="range" id="rangeTilt" min="0" max="45" step="0.5" value="23.5"></label>
+      </div>
+
+      <div id="pageClimate" class="tabpage">
+        <label class="slider"><span>Swirl &amp; eddies <output id="vortVal"></output></span>
+          <input type="range" id="rangeVort" min="0" max="1.5" step="0.05" value="0"></label>
+        <label class="slider"><span>Subsurface currents <output id="currVal"></output></span>
+          <input type="range" id="rangeCurr" min="0" max="1.5" step="0.05" value="0"></label>
+        <label class="slider"><span>Sun activity <output id="sunActVal"></output></span>
+          <input type="range" id="rangeSunAct" min="0" max="2" step="0.01" value="0.23"></label>
+        <label class="slider"><span>Atmosphere height <output id="atmVal"></output></span>
+          <input type="range" id="rangeAtm" min="0.05" max="20" step="0.05" value="5.4"></label>
+        <label class="slider"><span>Thunderstorm intensity <output id="stormVal"></output></span>
+          <input type="range" id="rangeStorm" min="-2" max="1" step="0.05" value="-1"></label>
+
+        <details class="fold wide">
+          <summary>Clouds &amp; precipitation</summary>
+          <details class="helpfold">
+            <summary>&#9432; About phase changes</summary>
+            <p class="help">Evaporated particles have substates. <b>Steam</b> rises with a thermal escape kick; once it has been aloft for a moment it condenses into a <b>cloud</b> particle when it is colder than the cloud point AND the surrounding steam density (a pressure proxy: steam particles per neighbouring cell) reaches the threshold &mdash; cloud formation is also gated above 30% of the atmosphere height so coastal fog does not condense on the sea surface. Only steam produces <b>rain</b>: steam colder than the rain point sheds its lift and free-falls; it lands and rejoins the sea (or freezes while falling through cold air). <b>Snow</b> appears from water or rain colder than the snow point &mdash; frozen in place, melting back when warmed. Clouds persist until warmed past the burn-off point or absorbed by the sea. The solver keeps snow &le; rain &le; cloud thresholds ordered regardless of the slider positions.</p>
+          </details>
+          <label class="slider"><span>Cloud point temperature <output id="cloudTVal"></output></span>
+            <input type="range" id="rangeCloudT" min="0" max="1.2" step="0.005" value="0.34"></label>
+          <label class="slider"><span>Cloud point pressure <output id="cloudPVal"></output></span>
+            <input type="range" id="rangeCloudP" min="0" max="3" step="0.05" value="0.35"></label>
+          <label class="slider"><span>Rain point temperature <output id="rainTVal"></output></span>
+            <input type="range" id="rangeRainT" min="0" max="1.2" step="0.005" value="0.22"></label>
+          <label class="slider"><span>Snow point temperature <output id="snowTVal"></output></span>
+            <input type="range" id="rangeSnowT" min="0" max="1.2" step="0.005" value="0.1"></label>
+          <label class="slider"><span>Ice melt point <output id="iceMeltVal"></output></span>
+            <input type="range" id="rangeIceMelt" min="0" max="1.2" step="0.005" value="0.105"></label>
+          <label class="slider"><span>Evaporation intensity <output id="evapIVal"></output></span>
+            <input type="range" id="rangeEvapI" min="0" max="1" step="0.01" value="0.05"></label>
+        </details>
+        <details class="helpfold wide">
+          <summary>&#9432; About the atmosphere &amp; water cycle</summary>
+          <p class="help">Eddies keep whirling after a splash; slow streams wander beneath the surface. Sun activity heats the lit side and drives evaporation: every liquid parcel above the freezing point can evaporate, with a probability that grows EXPONENTIALLY with the water temperature &mdash; the evaporation intensity scales that curve, so a hot day surface boils off while the cold night sea only seeps vapor. Vapor cloudlets ride circulating winds, stay aloft on a buoyant layer, and bounce off the atmosphere ceiling (probability rising with height) and off the terrain. In shade or at night vapor cools, condenses and rains back down; dense vapor pockets crackle with lightning &mdash; the thunderstorm slider scales how easily they fire (&times;0.01&ndash;&times;10, logarithmic, &times;0.1 by default). The atmosphere height is the REAL ceiling: evaporated particles and droplets can rise exactly that far above sea level, on any planet size.</p>
+        </details>
+        <!-- hidden per spec: the vapor ceiling-bounce curve stays 'linear' (kept in
+             the DOM so the solver binding keeps working; change via the console) -->
+        <label class="check wide" style="display:none"><span>Vapor ceiling reflection
+          <select id="selCeil">
+            <option value="linear" selected>Linear with height</option>
+            <option value="quadratic">Quadratic with height</option>
+            <option value="exponential">Exponential with height</option>
+          </select></span></label>
+      </div>
+
     </div>
-
-    <details class="fold">
-      <summary>Physics</summary>
-      <label class="slider"><span>Gravity <output id="gravityVal"></output></span>
-        <input type="range" id="rangeGravity" min="0" max="25" step="0.01" value="20"></label>
-      <label class="slider"><span>Viscosity &nu; <output id="viscVal"></output></span>
-        <input type="range" id="rangeVisc" min="0" max="0.02" step="0.0001" value="0.0005"></label>
-      <label class="slider"><span>PIC blend (smoothing) <output id="picVal"></output></span>
-        <input type="range" id="rangePic" min="0" max="0.3" step="0.01" value="0.15"></label>
-      <label class="slider"><span>Pressure iterations <output id="iterVal"></output></span>
-        <input type="range" id="rangeIters" min="10" max="120" step="5" value="20"></label>
-      <label class="slider"><span>Min substeps <output id="subVal"></output></span>
-        <input type="range" id="rangeSubsteps" min="1" max="4" step="1" value="1"></label>
-      <label class="slider"><span>Time scale <output id="timeVal"></output></span>
-        <input type="range" id="rangeTime" min="0.1" max="2" step="0.05" value="1"></label>
-      <label class="slider"><span>Surface threshold <output id="isoVal"></output></span>
-        <input type="range" id="rangeIso" min="0.2" max="3" step="0.01" value="1.8"></label>
-    </details>
-
-    <h2>Display</h2>
-    <label class="slider"><span>Water surface opacity <output id="wOpaVal"></output></span>
-      <input type="range" id="rangeWOpa" min="0.15" max="0.95" step="0.01" value="0.25"></label>
-    <!-- nonlinear track (mapped in main.js): bottom half = 0&ndash;0.1 in 0.02% steps,
-         top half = 0.1&ndash;1; value below is the slider POSITION for the 0.5 default -->
-    <label class="slider"><span>Spray &amp; atmosphere opacity <output id="pOpaVal"></output></span>
-      <input type="range" id="rangePOpa" min="0" max="1" step="0.001" value="0.722"></label>
-    <label class="check"><input type="checkbox" id="chkParticles" checked> Spray particles</label>
-    <label class="check"><input type="checkbox" id="chkSpin" checked> Particles rotation</label>
-    <label class="check"><input type="checkbox" id="chkBeads" checked> Water beads &mdash; glossy ball particles, no surface</label>
-    <label class="check"><input type="checkbox" id="chkVectors"> Water velocity vectors (direction &amp; speed)</label>
-    <label class="slider"><span>Motion blur <output id="blurVal"></output></span>
-      <input type="range" id="rangeBlur" min="0" max="0.95" step="0.05" value="0"></label>
-    <label class="check"><input type="checkbox" id="chkStars" checked> Stars &mdash; background starfield</label>
-    <label class="slider"><span>Star brightness <output id="starVal"></output></span>
-      <input type="range" id="rangeStars" min="0.2" max="2" step="0.1" value="1"></label>
-    <label class="check"><span>Resolution
-      <select id="selRes">
-        <option value="auto50">Auto detail &mdash; 50 FPS target</option>
-        <option value="auto25">Auto detail &mdash; 25 FPS target</option>
-        <option value="eco">Eco &mdash; 18³</option>
-        <option value="tiny">Tiny &mdash; 22³</option>
-        <option value="balanced">Balanced &mdash; 26³</option>
-        <option value="low">Low &mdash; 30³</option>
-        <option value="medium" selected>Medium &mdash; 40³</option>
-        <option value="high">High &mdash; 50³</option>
-        <option value="ultra">Ultra &mdash; 62³</option>
-        <option value="extreme">Extreme &mdash; 72³</option>
-      </select></span></label>
-    <button id="btnCalibrate">Recalibrate target (refills ocean)</button>
-    <details class="helpfold">
-      <summary>&#9432; About auto detail</summary>
-      <p class="help">Auto tests increasing grid, particle and rendering detail with a 20% frame-budget reserve. The highest passing tier stays fixed; render scale adapts without resetting water. Targets are not guarantees. Recalibrate after changing physics or window size.</p>
-    </details>
-
-    <h2>Planet size</h2>
-    <details class="helpfold">
-      <summary>&#9432; About planet size</summary>
-      <p class="help">Radius sizes the rocky globe (0.5&ndash;25 m — sea level, terrain relief, gravity, balls, camera and sky all scale with it, so every size behaves like the default world); ocean volume scales how much water fills it (particle count &times;0.1&ndash;&times;50 of the active detail preset); bumpiness 0 gives a smooth voxel ball. Applies on release.</p>
-    </details>
-    <label class="slider"><span>Planet radius <output id="coreVal"></output></span>
-      <input type="range" id="rangeCore" min="0.5" max="25" step="0.05" value="11"></label>
-    <label class="slider"><span>Ocean volume <output id="oceanVVal"></output></span>
-      <input type="range" id="rangeOceanV" min="0.1" max="50" step="0.1" value="3"></label>
-    <label class="slider"><span>Planet bumpiness <output id="bumpVal"></output></span>
-      <input type="range" id="rangeBump" min="0" max="2" step="0.05" value="0.15"></label>
-    <label class="slider"><span>Planet color &mdash; gouraud voxel terrain</span>
-      <input type="color" id="pickPlanet" value="#654321" style="width:100%;height:26px;cursor:pointer;background:none;border:none;padding:0"></label>
-    <label class="slider"><span>Water color &mdash; surface &amp; droplets</span>
-      <input type="color" id="pickWater" value="#2ab0f4" style="width:100%;height:26px;cursor:pointer;background:none;border:none;padding:0"></label>
-    <label class="slider"><span>Heat conductivity <output id="heatKVal"></output></span>
-      <input type="range" id="rangeHeatK" min="0" max="2" step="0.05" value="1.2"></label>
-
-    <h2>Orbit &amp; rotation</h2>
-    <details class="helpfold">
-      <summary>&#9432; About orbit, day/night &amp; seasons</summary>
-      <p class="help">The Sun is fixed; the planet revolves around it (one &ldquo;year&rdquo;) and spins about its vertical axis (one &ldquo;day&rdquo; &mdash; the day/night cycle). The spin axis can be tilted against the orbit (axial tilt &mdash; the tilted axis keeps its direction in space, so the year brings seasons: each hemisphere leans toward the Sun on opposite sides of the orbit). Shorter period = faster motion.</p>
-    </details>
-    <label class="slider"><span>Year &mdash; orbit around the Sun <output id="yearVal"></output></span>
-      <input type="range" id="rangeYear" min="0.5" max="30" step="0.5" value="20"></label>
-    <label class="slider"><span>Day &mdash; spin about its axis <output id="spinVal"></output></span>
-      <input type="range" id="rangeSpin" min="0.5" max="20" step="0.5" value="5"></label>
-    <label class="slider"><span>Axial tilt &mdash; spin axis vs orbit <output id="tiltVal"></output></span>
-      <input type="range" id="rangeTilt" min="0" max="45" step="0.5" value="23.5"></label>
-
-    <h2>Ocean dynamics</h2>
-    <label class="slider"><span>Swirl &amp; eddies <output id="vortVal"></output></span>
-      <input type="range" id="rangeVort" min="0" max="1.5" step="0.05" value="0"></label>
-    <label class="slider"><span>Subsurface currents <output id="currVal"></output></span>
-      <input type="range" id="rangeCurr" min="0" max="1.5" step="0.05" value="0"></label>
-    <label class="slider"><span>Sun activity <output id="sunActVal"></output></span>
-      <input type="range" id="rangeSunAct" min="0" max="2" step="0.01" value="0.23"></label>
-    <label class="slider"><span>Atmosphere height <output id="atmVal"></output></span>
-      <input type="range" id="rangeAtm" min="0.05" max="20" step="0.05" value="5.4"></label>
-    <label class="slider"><span>Thunderstorm intensity <output id="stormVal"></output></span>
-      <input type="range" id="rangeStorm" min="-2" max="1" step="0.05" value="-1"></label>
-
-    <details class="fold">
-      <summary>Clouds &amp; precipitation</summary>
-      <details class="helpfold">
-        <summary>&#9432; About phase changes</summary>
-        <p class="help">Evaporated particles have substates. <b>Steam</b> condenses into a <b>cloud</b> particle when it is colder than the cloud point AND the surrounding steam density (a pressure proxy: steam particles per neighbouring cell) reaches the threshold &mdash; cloud formation is gated above 30% of the atmosphere height so coastal fog does not condense on the sea surface. Only steam produces <b>rain</b>: steam colder than the rain point sheds its lift and falls; it lands and rejoins the sea (or freezes). <b>Snow</b> appears from water or rain colder than the snow point &mdash; frozen in place, melting back when warmed. Clouds persist until warmed past the burn-off point or absorbed by the sea. The solver keeps snow &le; rain &le; cloud thresholds ordered regardless of the slider positions.</p>
-      </details>
-      <label class="slider"><span>Cloud point temperature <output id="cloudTVal"></output></span>
-        <input type="range" id="rangeCloudT" min="0" max="1.2" step="0.005" value="0.34"></label>
-      <label class="slider"><span>Cloud point pressure <output id="cloudPVal"></output></span>
-        <input type="range" id="rangeCloudP" min="0" max="3" step="0.05" value="0.35"></label>
-      <label class="slider"><span>Rain point temperature <output id="rainTVal"></output></span>
-        <input type="range" id="rangeRainT" min="0" max="1.2" step="0.005" value="0.22"></label>
-      <label class="slider"><span>Snow point temperature <output id="snowTVal"></output></span>
-        <input type="range" id="rangeSnowT" min="0" max="1.2" step="0.005" value="0.1"></label>
-      <label class="slider"><span>Ice melt point <output id="iceMeltVal"></output></span>
-        <input type="range" id="rangeIceMelt" min="0" max="1.2" step="0.005" value="0.105"></label>
-      <label class="slider"><span>Evaporation point <output id="evapTVal"></output></span>
-        <input type="range" id="rangeEvapT" min="0" max="1.2" step="0.005" value="0.4"></label>
-    </details>
-    <!-- hidden per spec: the vapor ceiling-bounce curve stays 'linear' (kept in
-         the DOM so the solver binding keeps working; change via the console) -->
-    <label class="check" style="display:none"><span>Vapor ceiling reflection
-      <select id="selCeil">
-        <option value="linear" selected>Linear with height</option>
-        <option value="quadratic">Quadratic with height</option>
-        <option value="exponential">Exponential with height</option>
-      </select></span></label>
-    <details class="helpfold">
-      <summary>&#9432; About the atmosphere &amp; water cycle</summary>
-      <p class="help">Eddies keep whirling after a splash; slow streams wander beneath the surface. Sun activity heats the lit side and drives evaporation: every water surface parcel evaporates with probability growing exponentially from the coldest water temperature to the hottest, so the night side evaporates too &mdash; just much slower. Vapor cloudlets ride circulating winds, stay aloft on a buoyant layer, and bounce off the atmosphere ceiling (probability rising with height) and off the terrain. In shade vapor cools, condenses and rains back down; dense vapor pockets crackle with lightning &mdash; the thunderstorm slider scales how easily they fire (&times;0.01&ndash;&times;10, logarithmic, &times;0.1 by default). The atmosphere height is the REAL ceiling: evaporated particles and droplets can rise exactly that far above sea level, on any planet size.</p>
-    </details>
-
-    <details class="fold">
-      <summary>Help</summary>
-      <p class="help">
-        Drag &mdash; orbit camera &middot; wheel &mdash; zoom<br>
-        <b>Alt + drag</b> &mdash; stir the water<br>
-        Keys: <b>Space</b> pause &middot; <b>R</b> reset &middot; <b>S</b> splash &middot;
-        <b>B</b> ball &middot; <b>V</b> velocity vectors &middot; <b>P</b> particles
-      </p>
-    </details>
   </aside>
 
   <div id="hudRight">
-  <canvas id="tempChart" width="238" height="126" title="Particle temperature distribution — water vs evaporated (vapor)">
+  <canvas id="tempChart" width="238" height="126" title="Particle temperature distribution — water, vapor, ice, rain, cloud · log10 scale (floor 10⁻⁴)">
     <div class="help">particle temperature distribution</div></canvas>
   <div id="stats">
     <div><span>physics solver</span><b id="stBackend">CPU</b></div>

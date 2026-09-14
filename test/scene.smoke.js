@@ -81,7 +81,9 @@ THREE.PMREMGenerator = function () {
 window.MarchingTetrahedra = null;
 require('../js/surface.js');
 var MarchingTetrahedra = window.MarchingTetrahedra;
+var Metaballs = window.Metaballs;
 if (!MarchingTetrahedra) throw new Error('surface.js did not register MarchingTetrahedra');
+if (!Metaballs) throw new Error('surface.js did not register Metaballs');
 
 window.OrbitMini = null;
 require('../js/controls.js');
@@ -192,6 +194,189 @@ check('tilt 0 restores the classic upright spin', sc.tiltGroup.rotation.z === 0)
 // tiles, per-particle alpha, and camera-relative ordering
 sc.setBeadsMode(true);
 check('droplet mode hides the surface mesh', sc.waterMesh.visible === false);
+// metaball display: the mesh renders with its OWN material instance, seeded
+// to match the water look, hides the surface and takes geometry from the real
+// Metaballs build on a tiny solver
+sc.setMetaballs(true);
+check('metaball mode hides the surface mesh', sc.waterMesh.visible === false);
+(function () {
+  var mm = sc.metaballMesh.material, wm = sc.waterMat;
+  check('metaball mesh carries its own material instance, seeded to match the water',
+    mm !== wm && mm.isMeshPhysicalMaterial === wm.isMeshPhysicalMaterial &&
+    mm.color.getHexString() === wm.color.getHexString() &&
+    mm.opacity === wm.opacity && mm.roughness === wm.roughness &&
+    mm.clearcoat === wm.clearcoat &&
+    mm.emissive.getHexString() === wm.emissive.getHexString(),
+    'distinct=' + (mm !== wm) + ' color=' + mm.color.getHexString() +
+    '/' + wm.color.getHexString() + ' opa=' + mm.opacity + '/' + wm.opacity);
+  check('seeded skin material carries the metaball shader patch',
+    !!mm.userData.metaballPatch && mm.userData.metaballPatch.patched === true &&
+    mm.userData.metaballPatch.ripple === true && mm.userData.metaballPatch.alphaBoost === true &&
+    typeof mm.onBeforeCompile === 'function',
+    JSON.stringify(mm.userData.metaballPatch));
+})();
+var mbSolver = require('../js/solver.js');
+var mbs = new mbSolver({ nx: 14, ny: 14, nz: 14, dx: 0.35, targetParticles: 900,
+  mode: 'sphere', coreR: 1.1, bumpiness: 0 });
+mbs.resetWater(0.3 * 1.1);
+var mbMesh = Metaballs.build(mbs, 0.5);
+sc.updateMetaballs(mbMesh.pos, mbMesh.nrm, mbMesh.count);
+check('metaball build feeds the scene mesh', sc.metaballGeo.attributes.position.count > 0 &&
+  sc.metaballMesh.visible === true,
+  'verts=' + mbMesh.count + ' volume=' + mbMesh.volume.toFixed(3));
+sc.setMetaballs(false);
+check('metaball off clears draw range + restores surface', sc.metaballGeo.drawRange.count === 0);
+
+// ------------------------------ metaball material editor (own material)
+// The editor restyles metaballMat only; waterMat stays the water surface's.
+(function () {
+  var wm = sc.waterMat;
+
+  // follow-water rule: setWaterColor syncs the skin until the user picks a color
+  sc.setWaterColor('#2ab0f4');   // fresh scene: _mblaFollowWater still true
+  check('skin color follows the water picker before any editor pick',
+    sc.metaballMat.color.getHexString() === sc.waterMat.color.getHexString() &&
+    sc.metaballMat.emissive.getHexString() === sc.waterMat.emissive.getHexString(),
+    sc.metaballMat.color.getHexString() + ' vs ' + sc.waterMat.color.getHexString());
+  sc.setMetaballMaterial({ color: '#ff8800' });   // editor pick → user-owned
+  check('editor color pick detaches the skin from the water picker',
+    sc.metaballMat.color.getHexString() === 'ff8800' &&
+    sc.metaballMat.emissive.getHexString() === new THREE.Color('#ff8800').multiplyScalar(0.24).getHexString());
+  sc.setWaterColor('#123456');
+  check('water picker no longer moves a user-owned skin color',
+    sc.waterMat.color.getHexString() === '123456' &&
+    sc.metaballMat.color.getHexString() === 'ff8800',
+    'skin=' + sc.metaballMat.color.getHexString());
+
+  // baseline for the "editor never touches water" regression (captured AFTER
+  // the legitimate setWaterColor calls above — they own the water surface)
+  var wmColor = wm.color.getHexString(), wmOpa = wm.opacity, wmRough = wm.roughness, wmCoat = wm.clearcoat;
+
+  // opacity + gloss round-trip on the live physical material
+  sc.setMetaballMaterial({ opacity: 0.62, gloss: 0.4 });
+  check('editor opacity + gloss land on the skin material',
+    sc.metaballMat.opacity === 0.62 && sc.metaballMat.transparent === true &&
+    Math.abs(sc.metaballMat.roughness - 0.6) < 1e-9 && Math.abs(sc.metaballMat.clearcoat - 0.4) < 1e-9,
+    'opa=' + sc.metaballMat.opacity + ' rough=' + sc.metaballMat.roughness.toFixed(2) +
+    ' coat=' + sc.metaballMat.clearcoat.toFixed(2));
+
+  // texture-type switching: uniform-gated single shader — userData + gate
+  // uniforms flip, no rebuild (same instance), and the patched GLSL resolves
+  // against the REAL vendored templates for all three shading variants
+  var live = sc.metaballMat;
+  sc.setMetaballMaterial({ texture: 'noise' });
+  check('texture switch flips the gate uniforms without rebuilding the material',
+    sc.metaballMat === live && sc._mblaTexU.uMblaNoise.value === 1 &&
+    sc._mblaTexU.uMblaCaustic.value === 0 && sc._mblaTexU.uMblaStripes.value === 0 &&
+    live.userData.metaballPatch.texture === 'noise');
+  sc.setMetaballMaterial({ texture: 'caustic' });
+  check('caustic texture gates only the caustic layer',
+    sc.metaballMat === live && sc._mblaTexU.uMblaCaustic.value === 1 &&
+    sc._mblaTexU.uMblaNoise.value === 0 && live.userData.metaballPatch.texture === 'caustic');
+  sc.setMetaballMaterial({ texture: 'stripes' });
+  check('stripes texture gates only the stripe layer',
+    sc.metaballMat === live && sc._mblaTexU.uMblaStripes.value === 1 &&
+    sc._mblaTexU.uMblaCaustic.value === 0 && live.userData.metaballPatch.texture === 'stripes');
+  sc.setMetaballMaterial({ texture: 'none' });
+  check('texture none clears every layer gate',
+    sc._mblaTexU.uMblaNoise.value === 0 && sc._mblaTexU.uMblaCaustic.value === 0 &&
+    sc._mblaTexU.uMblaStripes.value === 0);
+  sc.setMetaballMaterial({ texture: 'bogus' });
+  check('unknown texture type is ignored (current type kept)',
+    sc._mblaTex === 'none' && live.userData.metaballPatch.texture === 'none');
+
+  function resolveShader(src) {
+    for (var depth = 0; depth < 8 && src.indexOf('#include <') >= 0; depth++) {
+      src = src.replace(/#include <([a-z0-9_]+)>/g, function (m, name) {
+        if (!THREE.ShaderChunk[name]) throw new Error('unknown chunk <' + name + '>');
+        return THREE.ShaderChunk[name];
+      });
+    }
+    if (src.indexOf('#include <') >= 0) throw new Error('unresolved includes after 8 rounds');
+    return src;
+  }
+  function braces(s) { return (s.split('{').length - 1) === (s.split('}').length - 1); }
+  var templateByShading = { physical: THREE.ShaderLib.physical, matte: THREE.ShaderLib.lambert, unlit: THREE.ShaderLib.basic };
+  var patchErr = '';
+  ['physical', 'matte', 'unlit'].forEach(function (shadeName) {
+    sc.setMetaballMaterial({ shading: shadeName });
+    var mat = sc.metaballMat;
+    var tpl = templateByShading[shadeName];
+    var shader = { uniforms: {}, vertexShader: tpl.vertexShader, fragmentShader: tpl.fragmentShader };
+    try {
+      mat.onBeforeCompile(shader);
+      var vSrc = resolveShader(shader.vertexShader);
+      var fSrc = resolveShader(shader.fragmentShader);
+      var composeAt = fSrc.indexOf('gl_FragColor = vec4( outgoingLight');
+      var boostAt = fSrc.indexOf('gl_FragColor.rgb *= min(');
+      if (!braces(vSrc) || !braces(fSrc)) throw new Error('unbalanced braces');
+      if (fSrc.indexOf('diffuseColor.rgb *= mShade') < 0) throw new Error('texture block missing');
+      if (fSrc.indexOf('uMblaNoise') < 0 || !shader.uniforms.uMblaNoise) throw new Error('gate uniforms missing');
+      if (composeAt < 0 || boostAt < 0 || boostAt < composeAt) throw new Error('alpha boost not after color composition');
+      if (fSrc.indexOf('output_fragment') >= 0) throw new Error('stale output_fragment anchor');
+      if (shadeName === 'physical') {
+        if (fSrc.indexOf('vec3 ripple') < 0) throw new Error('physical ripple missing');
+      } else if (fSrc.indexOf('vec3 ripple') >= 0) {
+        throw new Error('ripple must be skipped for ' + shadeName);
+      }
+    } catch (e) { patchErr = shadeName + ': ' + e.message; }
+  });
+  check('editor patch resolves against the real r128 templates (all 3 shading models)',
+    !patchErr, patchErr || 'ok');
+
+  // shading-model swap: right class, state carried over, old instance disposed
+  var realDispose = THREE.Material.prototype.dispose;
+  var disposedMats = [];
+  THREE.Material.prototype.dispose = function () { disposedMats.push(this); realDispose.call(this); };
+  var beforeSwap = sc.metaballMat;
+  sc.setMetaballMaterial({ shading: 'matte' });
+  check('matte swap produces MeshLambertMaterial and carries color/opacity/gloss',
+    sc.metaballMat.isMeshLambertMaterial === true && sc.metaballMat !== beforeSwap &&
+    sc.metaballMesh.material === sc.metaballMat &&
+    sc.metaballMat.color.getHexString() === 'ff8800' &&
+    sc.metaballMat.opacity === 0.62 && sc.metaballGloss === 0.4,
+    'class=' + sc.metaballMat.type + ' color=' + sc.metaballMat.color.getHexString());
+  sc.setMetaballMaterial({ shading: 'unlit' });
+  check('unlit swap produces MeshBasicMaterial (flat, still blended)',
+    sc.metaballMat.isMeshBasicMaterial === true && sc.metaballMat.transparent === true &&
+    sc.metaballMesh.material === sc.metaballMat);
+  var matteMat = sc.metaballMat;   // the instance the physical swap must dispose
+  sc.setMetaballMaterial({ shading: 'physical' });
+  THREE.Material.prototype.dispose = realDispose;
+  check('swap back to physical re-applies the gloss mapping and disposes the swapped-out instances',
+    sc.metaballMat.isMeshPhysicalMaterial === true &&
+    Math.abs(sc.metaballMat.roughness - 0.6) < 1e-9 && Math.abs(sc.metaballMat.clearcoat - 0.4) < 1e-9 &&
+    sc.metaballMesh.material === sc.metaballMat &&
+    disposedMats.indexOf(beforeSwap) >= 0 && disposedMats.indexOf(matteMat) >= 0,
+    'disposed=' + disposedMats.length);
+  check('shading swap back to physical restores the ripple patch',
+    sc.metaballMat.userData.metaballPatch.ripple === true);
+
+  // the editor never touches the regular water surface
+  check('editor calls leave the water surface material untouched',
+    sc.waterMat.color.getHexString() === wmColor && sc.waterMat.opacity === wmOpa &&
+    sc.waterMat.roughness === wmRough && sc.waterMat.clearcoat === wmCoat,
+    'water=' + sc.waterMat.color.getHexString() + '/' + sc.waterMat.opacity);
+
+  // the waterMat patch-target fix: the alpha pre-boost is anchored on a chunk
+  // that exists in r128 and runs AFTER gl_FragColor is composed (the old
+  // <output_fragment> anchor was a silent no-op in this vendored build)
+  var wShader = { uniforms: {}, vertexShader: THREE.ShaderLib.physical.vertexShader,
+    fragmentShader: THREE.ShaderLib.physical.fragmentShader };
+  var wErr = '';
+  try {
+    wm.onBeforeCompile(wShader);
+    var fSrc = resolveShader(wShader.fragmentShader);
+    var composeAt = fSrc.indexOf('gl_FragColor = vec4( outgoingLight');
+    var boostAt = fSrc.indexOf('gl_FragColor.rgb *= min(');
+    if (composeAt < 0 || boostAt < 0 || boostAt < composeAt) throw new Error('boost not after color composition');
+    if (fSrc.indexOf('output_fragment') >= 0) throw new Error('stale output_fragment anchor');
+    if (fSrc.indexOf('vec3 ripple') < 0) throw new Error('water ripple missing');
+  } catch (e) { wErr = e.message; }
+  check('water patch boost runs after alpha composition (dithering_fragment anchor, no output_fragment)',
+    !wErr, wErr || 'ok');
+})();
+
 var fakeSolver = { nP: 2, px: new Float32Array([2.5, 2.6]), py: new Float32Array([2.5, 2.7]),
   pz: new Float32Array([2.5, 2.5]), pvx: new Float32Array(2), pvy: new Float32Array(2),
   pvz: new Float32Array(2), pflag: new Uint8Array(2), spacing: 0.06, pT: new Float32Array([0.3, 0.3]) };
@@ -206,8 +391,9 @@ sc.setBeadsMode(true);
 // circles draw call + water-surface opacity coupling + exposure shading
 sc.setBeadsMode(true);
 fakeSolver.pLight = new Float32Array([0.9, 0.1]);   // solver-computed sun exposure
-// straddle the terminator along the scene's default sun direction
-// _sunDirLocal ≈ (0.912, 0.410, 0): bead 0 = night hemisphere, bead 1 = day
+// straddle the terminator along the scene's default sun direction (the sun
+// now sits in the orbital plane, so _sunDirLocal.y ≈ 0 at tilt 0: bead 0 =
+// night hemisphere, bead 1 = day)
 fakeSolver.px = new Float32Array([2.55 - 0.5 * 0.912, 2.55 + 0.5 * 0.912]);
 fakeSolver.py = new Float32Array([2.55 - 0.5 * 0.410, 2.55 + 0.5 * 0.410]);
 fakeSolver.pz = new Float32Array([2.5, 2.5]);
@@ -290,6 +476,115 @@ check('setPlanetColor runs (palette recolored, material white)',
 sc.render(1 / 60);
 check('render with terrain runs', true);
 
+// --------------------------------- procedural high-detail terrain texture
+// The terrain material carries a shader-injected procedural detail layer
+// (value-noise fbm albedo + grain + slope/dust tint + derivative bump). It
+// must stay a lit Phong material, modulate around the palette, add no texture
+// to dispose, keep per-metre density across planet sizes, and dispose cleanly
+// on rebuild.
+(function () {
+  var mat = sc._terrainMesh && sc._terrainMesh.material;
+  var fd = mat && mat.userData.terrainDetail;
+  check('terrain material carries the procedural detail patch',
+    !!fd && fd.patched === true && typeof mat.onBeforeCompile === 'function',
+    fd ? JSON.stringify(fd) : 'no terrainDetail');
+  check('terrain stays a lit Phong material (sun + shadows still apply)',
+    !!mat && mat.isMeshPhongMaterial === true && !mat.isShaderMaterial &&
+    mat.lights !== false && mat.vertexColors === true,
+    mat && mat.type);
+  check('detail frequencies derive from metre constants (grain = higher octave)',
+    !!fd && fd.freqPerMetre === 1 / fd.metresPerCell &&
+    fd.grainPerMetre === 1 / fd.grainMetresPerCell &&
+    fd.grainPerMetre > fd.freqPerMetre && fd.bump >= 0,
+    'base=' + (fd && fd.freqPerMetre.toFixed(3)) + '/m grain=' + (fd && fd.grainPerMetre.toFixed(2)) + '/m');
+
+  // run the REAL patch against the REAL vendored Phong templates, resolve
+  // every #include through three's own ShaderChunk, then validate the GLSL
+  var ph = THREE.ShaderLib.phong;
+  var shader = { uniforms: {}, vertexShader: ph.vertexShader, fragmentShader: ph.fragmentShader };
+  var vSrc = '', fSrc = '', patchErr = '';
+  try {
+    mat.onBeforeCompile(shader);
+    function resolve(src) {
+      for (var depth = 0; depth < 8 && src.indexOf('#include <') >= 0; depth++) {
+        src = src.replace(/#include <([a-z0-9_]+)>/g, function (m, name) {
+          if (!THREE.ShaderChunk[name]) throw new Error('unknown chunk <' + name + '>');
+          return THREE.ShaderChunk[name];
+        });
+      }
+      if (src.indexOf('#include <') >= 0) throw new Error('unresolved includes after 8 rounds');
+      return src;
+    }
+    vSrc = resolve(shader.vertexShader);
+    fSrc = resolve(shader.fragmentShader);
+  } catch (e) { patchErr = e.message; }
+  function braces(s) { return (s.split('{').length - 1) === (s.split('}').length - 1); }
+  check('detail patch rewrites the real Phong shader (chunks resolve, braces balance)',
+    !patchErr && braces(vSrc) && braces(fSrc) &&
+    vSrc.indexOf('varying vec3 vTerrPos;') >= 0 && vSrc.indexOf('vTerrPos = position') >= 0 &&
+    fSrc.indexOf('varying vec3 vTerrPos;') >= 0 &&
+    fSrc.indexOf('float tTerrH = tFbm(') >= 0 &&
+    fSrc.indexOf('diffuseColor.rgb *= tTerrShade') >= 0,
+    patchErr || 'ok');
+  check('detail uniforms are declared and consumed in the patched fragment shader',
+    !patchErr && ['uTerrFreq', 'uTerrGrain', 'uTerrBump', 'uTerrCenter'].every(function (u) {
+      return !!shader.uniforms[u] && shader.uniforms[u].value !== undefined &&
+        fSrc.split(u).length - 1 >= 2;
+    }) &&
+    shader.uniforms.uTerrFreq.value === fd.freqPerMetre &&
+    shader.uniforms.uTerrGrain.value === fd.grainPerMetre,
+    'ok');
+  check('bump derivatives reference the fbm height already in scope',
+    !patchErr && braces(fSrc) &&
+    fSrc.indexOf('float tTerrH = tFbm(') < fSrc.indexOf('dFdx(tTerrH)') &&
+    fSrc.indexOf('float faceDirection') >= 0 &&
+    fSrc.indexOf('float faceDirection') < fSrc.indexOf('tDet = dot('),
+    'ok');
+  check('detail adds no texture to dispose (pure shader noise, no UVs)',
+    !patchErr && fSrc.indexOf('uTerr') >= 0 && fSrc.indexOf('sampler2D uTerr') < 0 &&
+    (!mat.map || mat.map === null) && mat.userData.terrainDetail.patched === true,
+    'map=' + (mat && mat.map));
+
+  // world-scale invariance: identical per-metre frequencies on a ~1.6 m and a
+  // ~19 m rock while the mesh geometry itself scales with the planet (the
+  // noise samples mesh-local METRES, so density per metre cannot drift)
+  function detailAt(dv, rsl, rhi, seedKey) {
+    var tn2 = 8, solid2 = new Uint8Array(tn2 * tn2 * tn2);
+    var field2 = new Float32Array((tn2 + 1) * (tn2 + 1) * (tn2 + 1));
+    for (var k2 = 2; k2 < 6; k2++) for (var j2 = 2; j2 < 6; j2++) for (var i2 = 2; i2 < 6; i2++) {
+      solid2[(k2 * tn2 + j2) * tn2 + i2] = 1;
+      field2[((k2 + 1) * (tn2 + 1) + (j2 + 1)) * (tn2 + 1) + i2] = 1;
+    }
+    for (var fc2 = 0; fc2 < field2.length; fc2++) if (field2[fc2] === 0) field2[fc2] = -1;
+    sc.buildTerrain({ n: tn2, dv: dv, solid: solid2, R: new Float32Array(tn2 * tn2 * tn2),
+      field: field2, Rsl: rsl, Rlo: rsl - 0.4, Rhi: rhi, landFrac: 0.27, seed: seedKey }, '#654321');
+    var msh = sc._terrainMesh;
+    msh.geometry.computeBoundingSphere();
+    return { mat: msh.material, r: msh.geometry.boundingSphere.radius,
+      vcount: msh.userData.vcount, fd: msh.material.userData.terrainDetail };
+  }
+  var small = detailAt(0.4, 1.9, 2.2, 1);       // 1.6 m rock — small-planet class
+  var big = detailAt(4.8, 22.8, 26.4, 2);       // 19.2 m rock — 25 m planet class
+  check('detail density is identical per metre across planet radii',
+    small.vcount > 0 && big.vcount > 0 &&
+    small.fd.freqPerMetre === big.fd.freqPerMetre &&
+    small.fd.grainPerMetre === big.fd.grainPerMetre &&
+    small.fd.metresPerCell === big.fd.metresPerCell &&
+    Math.abs(big.r / small.r - 12) < 1e-4,
+    'mesh radii ' + small.r.toFixed(3) + ' m vs ' + big.r.toFixed(3) +
+    ' m (×' + (big.r / small.r).toFixed(2) + '), same freq ' + big.fd.freqPerMetre.toFixed(3) + '/m');
+
+  // rebuild path: the old material is disposed and the detail state is rebuilt
+  var m0 = sc._terrainMesh.material, disposals = 0, origDispose = m0.dispose;
+  m0.dispose = function () { disposals++; origDispose.call(this); };
+  var third = detailAt(0.4, 1.9, 2.2, 3);
+  check('terrain rebuild disposes the old material and swaps fresh detail state',
+    disposals === 1 && third.mat !== m0 && !!third.fd && third.fd !== m0.userData.terrainDetail,
+    'disposals=' + disposals);
+  sc.render(1 / 60);
+  check('render with detailed terrain runs', true);
+})();
+
 sc.setWorld(W, H, D, { coreR: 1.2, oceanR: 1.65 });   // rebuild path
 check('setWorld rebuild runs', true);
 sc.render(1 / 60);
@@ -299,7 +594,7 @@ check('render after rebuild runs', true);
 // Fake DOM with every element the app touches, then fire DOMContentLoaded and
 // run two frames. If anything in the real startup path throws, this fails.
 var IDS = ['stVapor','stQuality','loadingText','btnCalibrate','rangeWOpa','wOpaVal','btnClearBalls','btnPause','btnReset',
-  'chkBeads','chkParticles','coreVal','gravityVal','hdr','isoVal','iterVal',
+  'chkBeads','chkMetaballs','rangeMbla','mblaVal','rangeMblaTess','tessVal','chkParticles','coreVal','gravityVal','hdr','isoVal','iterVal',
   'heatKVal','currVal','vortVal','rangeCurr','rangeVort','loading','oceanVVal','pOpaVal','panel',
   'pickPlanet','pickWater','rangeBump','bumpVal','rangeSunAct','sunActVal','rangeAtm','atmVal','stDry',
   'picVal','rangeHeatK','rangeCore','rangeGravity','rangeIso','viscVal',
@@ -309,12 +604,17 @@ var IDS = ['stVapor','stQuality','loadingText','btnCalibrate','rangeWOpa','wOpaV
   'stBackend','solverBadge',
   'panelToggle','panelClose','rangeCloudT','cloudTVal','rangeCloudP','cloudPVal',
   'rangeRainT','rainTVal','rangeSnowT','snowTVal',
-  'rangeIceMelt','iceMeltVal','rangeEvapT','evapTVal','btnEarth',
-  'rangeBlur','blurVal','chkStars','rangeStars','starVal','chkSpin'];
+  'rangeIceMelt','iceMeltVal','rangeEvapI','evapIVal','btnEarth',
+  // centered tabbed pane: five tab buttons + five pages
+  'tabPhysics','tabDisplay','tabPlanet','tabOrbit','tabClimate',
+  'pagePhysics','pageDisplay','pagePlanet','pageOrbit','pageClimate',
+  'rangeBlur','blurVal','chkStars','rangeStars','starVal','chkSpin','chkSpinColor',
+  // Metaball material editor (fold + its five controls + readouts)
+  'mblaEditorFold','pickMbla','selMblaShade','selMblaTex','rangeMblaOpa','mblaOpaVal','rangeMblaGloss','mblaGlaVal'];
 var elements = {};
 IDS.forEach(function (id) {
   elements[id] = {
-    id: id, style: {}, value: id === 'selRes' ? 'medium' : '0',
+    id: id, style: {}, value: id === 'selRes' ? 'tiny' : '0',
     textContent: '', checked: false,
     classList: { toggle: function () {}, add: function () {}, remove: function () {} },
     setAttribute: function () {}, getAttribute: function () { return null; },
@@ -339,6 +639,7 @@ global.window.requestAnimationFrame = global.requestAnimationFrame;
 global.FluidSolver = window.FluidSolver || require('../js/solver.js');
 global.WaterScene = window.WaterScene;
 global.MarchingTetrahedra = window.MarchingTetrahedra;
+global.Metaballs = window.Metaballs;
 global.OrbitMini = window.OrbitMini;
 
 global.AdaptiveQuality = require('../js/quality.js');
@@ -368,8 +669,8 @@ if (!bootListeners.length) {
     check('stats row names the physics solver', elements.stBackend.textContent.indexOf('CPU') !== -1,
       JSON.stringify(elements.stBackend.textContent));
     var dbg = global.window.waterSimDebug;
-    check('shipped boot uses the 11 m default planet on the manual Medium tier',
-      dbg && dbg.params.coreR === 11 && dbg.activeRes === 'medium' &&
+    check('shipped boot uses the 11 m default planet on the manual Tiny tier',
+      dbg && dbg.params.coreR === 11 && dbg.activeRes === 'tiny' &&
       dbg.solver && Math.abs(dbg.solver.coreR - 11) < 1e-9,
       'coreR=' + (dbg ? dbg.params.coreR : '-') + ' res=' + (dbg ? dbg.activeRes : '-'));
   } catch (err) {
