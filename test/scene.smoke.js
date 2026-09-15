@@ -446,6 +446,33 @@ check('vapor renders as broad low-opacity cloudlets (bigger, fainter)',
   sc.allSize[vapI] > 0.1 && sc.allAlpha[vapI] < 0.3,
   'vapor size=' + sc.allSize[vapI].toFixed(3) + ' alpha=' + sc.allAlpha[vapI].toFixed(3));
 
+// cloud-sprite display mode (img/cloud_sprite.png → dedicated texture, draw
+// list tile 5): until the image has loaded (headless it never fetches) clouds
+// keep the procedural puff tile; once "loaded" the same particle swaps to the
+// sprite tile at the puff's OWN size (geometry never differs between looks)
+check('particle material carries the dedicated uCloudMap sampler',
+  !!sc.allMat.uniforms.uCloudMap && !!sc.allMat.uniforms.uCloudMap.value);
+sc.setCloudSprite(true);
+fakeSolver.pflag = new Uint8Array([3, 2]);
+sc.updateParticles(fakeSolver, true);
+var clIdx = sc.allSprite[0] === 2 ? 1 : 0;   // vapor keeps tile 2 — the cloud is the other slot
+var puffSz = sc.allSize[clIdx];
+check('cloud-sprite mode keeps the puff tile until the sprite image has loaded',
+  sc._classCounts.cloud === 1 && sc.allSprite[clIdx] === 3,
+  'tile=' + sc.allSprite[clIdx] + ' size=' + puffSz.toFixed(3));
+sc._cloudSpriteReady = true;   // simulate the finished fetch (no Image headless)
+sc.updateParticles(fakeSolver, true);
+clIdx = sc.allSprite[0] === 2 ? 1 : 0;
+check('cloud-sprite mode draws cloud puffs from the cloud_sprite tile (5, puff size)',
+  sc.allSprite[clIdx] === 5 && Math.abs(sc.allSize[clIdx] - puffSz) < 1e-6,
+  'tile=' + sc.allSprite[clIdx] + ' size=' + sc.allSize[clIdx].toFixed(3));
+sc.setCloudSprite(false);
+sc._cloudSpriteReady = false;
+sc.updateParticles(fakeSolver, true);
+clIdx = sc.allSprite[0] === 2 ? 1 : 0;
+check('leaving cloud-sprite mode restores the procedural puff tile',
+  sc.allSprite[clIdx] === 3, 'tile=' + sc.allSprite[clIdx]);
+
 sc.syncBalls([{ x: 2.55, y: 3.4, z: 2.55, r: 0.3 }]);
 check('syncBalls runs', true);
 
@@ -594,7 +621,7 @@ check('render after rebuild runs', true);
 // Fake DOM with every element the app touches, then fire DOMContentLoaded and
 // run two frames. If anything in the real startup path throws, this fails.
 var IDS = ['stVapor','stQuality','loadingText','btnCalibrate','rangeWOpa','wOpaVal','btnClearBalls','btnPause','btnReset',
-  'chkBeads','chkMetaballs','rangeMbla','mblaVal','rangeMblaTess','tessVal','chkParticles','coreVal','gravityVal','hdr','isoVal','iterVal',
+  'chkBeads','chkMetaballs','rangeMbla','mblaVal','rangeMblaTess','tessVal','chkParticles','chkCloudSprite','coreVal','gravityVal','hdr','isoVal','iterVal',
   'heatKVal','currVal','vortVal','rangeCurr','rangeVort','loading','oceanVVal','pOpaVal','panel',
   'pickPlanet','pickWater','rangeBump','bumpVal','rangeSunAct','sunActVal','rangeAtm','atmVal','stDry',
   'picVal','rangeHeatK','rangeCore','rangeGravity','rangeIso','viscVal',

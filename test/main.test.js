@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const Q = require('../js/quality.js');
 let clock = 0, queue = [], stepCalls = 0, surfaceCalls = 0, particleCalls = 0, mbCalls = 0, mbDetail = null;
 const mblaMatCalls = [];   // setMetaballMaterial calls received by the scene stub
+const cloudSpriteCalls = [];   // setCloudSprite calls received by the scene stub
 const elements = {}, winListeners = {};
 const html = fs.readFileSync(require.resolve('../index.html'), 'utf8');
 const chartCalls = { fillRect: 0, fillText: 0, clearRect: 0, strokes: 0, texts: [], styles: new Set() };
@@ -62,6 +63,7 @@ class Scene {
   syncBalls() {} showHandle() {} render() { clock += 1; }
   updatePlanetMotion() {} setYearPeriod() {} setSpinPeriod() {} planetToLocal(out) { return out; }
   setTilt() {} setBeadsMode() {} setMetaballs() {} setMotionBlur() {} setStars() {}
+  setCloudSprite(on) { cloudSpriteCalls.push(on); }
   updateVectors() {} updateLightning() {} setVectorsEnabled() {} updateMetaballs() {}
   setMetaballMaterial(o) { mblaMatCalls.push(Object.assign({}, o)); }
 }
@@ -185,4 +187,12 @@ assert.equal(dbgParams.metaballGloss, 0.3, 'gloss slider updates params');
 assert.deepEqual(mblaMatCalls.at(-1), { gloss: 0.3 }, 'gloss slider calls setMetaballMaterial({gloss})');
 assert.equal(elements.mblaGlaVal.textContent, '30%', 'gloss readout shows percent');
 assert.equal(mblaMatCalls.length, 7, 'every editor interaction reached the scene exactly once');
+// cloud-sprite display checkbox: param store + scene call (boot applied the
+// stub's checked:true default first, so the call log already holds one entry)
+elements.chkCloudSprite.checked = false; elements.chkCloudSprite.handlers.change.call(elements.chkCloudSprite);
+assert.equal(dbgParams.cloudSprite, false, 'cloud-sprite checkbox stores the param');
+assert.equal(cloudSpriteCalls.at(-1), false, 'cloud-sprite toggle off reaches the scene');
+elements.chkCloudSprite.checked = true; elements.chkCloudSprite.handlers.change.call(elements.chkCloudSprite);
+assert.equal(dbgParams.cloudSprite, true, 'cloud-sprite checkbox stores the re-enabled param');
+assert.equal(cloudSpriteCalls.at(-1), true, 'cloud-sprite toggle on reaches the scene');
 console.log('ALL APPLICATION LOOP TESTS PASSED');

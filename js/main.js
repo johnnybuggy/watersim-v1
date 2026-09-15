@@ -40,6 +40,7 @@ var params = {
   showVectors: false,
   tiltDeg: 23.5,
   waterBeads: true,
+  cloudSprite: false,   // cloud puffs draw the img/cloud_sprite.png sprite (off by default)
   metaballs: false,     // metaball visualization: water particles fused into a liquid skin
   metaballTension: 0.5, // tension between particles (kernel reach 1.6..3.8 spacings)
   metaballTess: 0.5,    // tessellation detail: field-lattice scale ×0.6..×1.4 (0.5 → ×1.0)
@@ -597,6 +598,7 @@ function init() {
   scene.setMetaballs(params.metaballs);
   scene.setMotionBlur(params.motionBlur);
   scene.setStars(params.stars, params.starBrightness);
+  scene.setCloudSprite(params.cloudSprite);
 
   // gentle welcome slosh
   solver.waveImpulse(1.1);
@@ -837,6 +839,16 @@ function bindUI() {
   $('chkParticles').addEventListener('change', function () { params.showParticles = this.checked; });
   $('chkSpin').addEventListener('change', function () { params.particleSpin = this.checked; });
   $('chkSpinColor').addEventListener('change', function () { params.spinColor = this.checked; });
+  // cloud-sprite display mode: cloud puffs sample the img/cloud_sprite.png
+  // atlas tile instead of the procedural circle (display-only switch)
+  var chkCloudSprite = $('chkCloudSprite');
+  if (chkCloudSprite) {
+    params.cloudSprite = chkCloudSprite.checked;
+    chkCloudSprite.addEventListener('change', function () {
+      params.cloudSprite = this.checked;
+      scene.setCloudSprite(params.cloudSprite);
+    });
+  }
 
   bindRange('rangeBlur', 'blurVal', function () { return params.motionBlur; },
     function (v) {

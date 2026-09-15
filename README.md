@@ -100,6 +100,19 @@ with per-star color temperature (white / blue-white / warm / amber) and a
 subtle per-layer twinkle. It sits inside the sky dome and rescales with the
 planet, so giant worlds keep their sky.
 
+**Cloud sprite** (Display checkbox, off by default) — cloud particles
+normally draw as soft grey circles (atlas tile 3). With this option the
+scene loads `img/cloud_sprite.png` into its **own texture** (uploaded once
+when the image arrives; the shared atlas is never repainted) and every
+cloud puff samples it instead — keeping the puff's exact point size, the
+sun-exposure tint, the spray/atmosphere opacity and the global camera
+sorting, so the option changes only the sprite content, never the geometry.
+The image is **cover-cropped** into the square sprite (its dense central
+band fills the whole point) and the border is feathered with a radial dome,
+so each particle is a soft round puff of the sprite's fluff — no hard edges
+or letterboxing. Until the image has fetched (or where images are
+unavailable) clouds keep the procedural circles.
+
 ## The physics
 
 ### 1. Governing equations

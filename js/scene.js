@@ -86,10 +86,20 @@ function makeCloudTexture() {
 }
 
 // ---------------------------------------------------- particle sprite atlas
-// All five particle sprites live in ONE 3×2 tile atlas so a single Points
-// draw call can render every airborne class (liquid beads, glossy spray,
-// vapor cloudlets, cloud puffs, snow). Tile ids match the CLS_* constants.
+// All particle sprites live in ONE 3×2 tile atlas so a single Points draw
+// call can render every airborne class (liquid beads, glossy spray, vapor
+// cloudlets, cloud puffs, snow). Tile ids match the CLS_* constants; five
+// procedural tiles are painted, cell 5 stays empty.
 var ATLAS_COLS = 3, ATLAS_ROWS = 2, ATLAS_TILE = 64;
+// Cloud-sprite option (Display tab): img/cloud_sprite.png gets its OWN
+// texture (makeCloudSpriteTexture, uploaded once when the image arrives) and
+// tile id 5 then marks cloud puffs in the draw list; the fragment shader
+// samples that dedicated texture for tile 5 points. The shared atlas is
+// never repainted — nothing can leave a half-updated atlas on the GPU — and
+// until the image has loaded (or when images are unavailable, e.g. headless)
+// tile 5 is never emitted: clouds keep the procedural puff (tile 3).
+var CLOUD_SPRITE_URL = 'img/cloud_sprite.png';
+var CLOUD_SPRITE_TILE = 5;
 function makeParticleAtlas() {
   var tiles = [
     makeSpriteTexture(),      // 0 flat disc (liquid body, beads mode)
@@ -120,6 +130,40 @@ function makeParticleAtlas() {
   tex.flipY = false;
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
+  return tex;
+}
+
+// Dedicated texture for the cloud-sprite option: img/cloud_sprite.png is
+// uploaded DIRECTLY (no canvas round-trip — one-shot upload, and file://
+// canvaces stay untainted). Same sampling contract as the atlas: flipY off
+// (v0 = image top → upright sprite), LINEAR filtering, clamp; the image is
+// NPOT (579×257), which WebGL samples fine with clamp+linear+no mipmaps.
+// The fragment shader covers the square point with the image's central band
+// (cover-crop via uCloudAspect) and feathers the border with a radial dome,
+// so every particle is a soft round puff of the sprite's fluff — never a
+// letterboxed slab or a hard-edged rectangle. Returns null if unusable.
+function makeCloudSpriteTexture(img) {
+  if (!img.naturalWidth) return null;
+  var tex = new THREE.Texture(img);
+  tex.flipY = false;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;                       // upload once, on first use
+  return tex;
+}
+
+// 1×1 transparent placeholder so the uCloudMap uniform always holds a valid
+// texture. It is only SAMPLED for tile-5 points, which updateParticles never
+// emits until the sprite image has actually loaded — so the placeholder is
+// never visible.
+function makeEmptyTexture() {
+  var c = document.createElement('canvas');
+  c.width = c.height = 1;
+  var g = c.getContext && c.getContext('2d');
+  if (g && g.clearRect) g.clearRect(0, 0, 1, 1);
+  var tex = new THREE.CanvasTexture(c);
+  tex.flipY = false;
   return tex;
 }
 
@@ -845,9 +889,17 @@ function WaterScene(container, W, H, D, opts) {
   this.allGeo.setAttribute('aSize', new THREE.BufferAttribute(this.allSize, 1).setUsage(THREE.DynamicDrawUsage));
   this.allGeo.setAttribute('aSprite', new THREE.BufferAttribute(this.allSprite, 1).setUsage(THREE.DynamicDrawUsage));
   this.atlasTex = makeParticleAtlas();
+  // Cloud-sprite option state (Display checkbox → setCloudSprite): the image
+  // fetch starts once, here — the scene object survives world rebuilds, so
+  // the sprite texture (and the readiness flag) outlives every setWorld call.
+  this.cloudSpriteMode = false;
+  this._cloudSpriteReady = false;
+  this.cloudSpriteTex = null;
   this.allMat = new THREE.ShaderMaterial({
     uniforms: {
       uAtlas: { value: this.atlasTex },
+      uCloudMap: { value: makeEmptyTexture() },
+      uCloudAspect: { value: 1 },   // img.h/img.w — set when the sprite loads
       uTiles: { value: new THREE.Vector2(ATLAS_COLS, ATLAS_ROWS) },
       uPointScale: { value: 300 }
     },
@@ -869,16 +921,31 @@ function WaterScene(container, W, H, D, opts) {
     ].join('\n'),
     fragmentShader: [
       'uniform sampler2D uAtlas;',
+      'uniform sampler2D uCloudMap;',
+      'uniform float uCloudAspect;',
       'uniform vec2 uTiles;',
       'varying vec3 vCol;',
       'varying float vA;',
       'varying float vT;',
       'void main() {',
       '  float tile = floor(vT + 0.5);',
-      '  float tx = mod(tile, uTiles.x);',
-      '  float ty = floor(tile / uTiles.x);',
-      '  vec2 uv = (vec2(tx, ty) + clamp(gl_PointCoord, 0.03, 0.97)) / uTiles;',
-      '  vec4 tex = texture2D(uAtlas, uv);',
+      '  vec2 pc = clamp(gl_PointCoord, 0.03, 0.97);',
+      '  vec4 tex;',
+      '  if (tile > 4.5) {',
+      '    // cloud sprite: COVER-crop the image into the square point — sample',
+      '    // its central band (full height on a wide image) so the fluff fills',
+      '    // the whole sprite — then feather the border with a radial dome:',
+      '    // a soft round puff, never a letterboxed slab or a hard rectangle',
+      '    vec2 cuv = (uCloudAspect < 1.0)',
+      '      ? vec2(0.5 + (pc.x - 0.5) * uCloudAspect, pc.y)',
+      '      : vec2(pc.x, 0.5 + (pc.y - 0.5) / uCloudAspect);',
+      '    tex = texture2D(uCloudMap, cuv);',
+      '    tex.a *= 1.0 - smoothstep(0.30, 0.48, length(pc - 0.5));',
+      '  } else {',
+      '    float tx = mod(tile, uTiles.x);',
+      '    float ty = floor(tile / uTiles.x);',
+      '    tex = texture2D(uAtlas, (vec2(tx, ty) + pc) / uTiles);',
+      '  }',
       '  float a = tex.a * vA;',
       '  if (a < 0.02) discard;',
       '  gl_FragColor = vec4(vCol * tex.rgb, a);',
@@ -893,6 +960,9 @@ function WaterScene(container, W, H, D, opts) {
   this.allPts.renderOrder = 2;         // under the water surface film (4)
   this.allPts.visible = false;         // draw range set by updateParticles
   this.planetGroup.add(this.allPts);
+  // the sprite-image fetch needs the material to exist (onload swaps the
+  // uCloudMap uniform) — kick it off once, here
+  this._loadCloudSpriteImage();
   // per-class staging (same names the sorting pass reads back)
   this.pPos = new Float32Array(27); this.pCol = new Float32Array(27);   // spray/rain
   this.vPos = new Float32Array(27); this.vCol = new Float32Array(27);   // vapor
@@ -1718,6 +1788,10 @@ WaterScene.prototype.updateParticles = function (solver, show) {
   var spraySz = spSz * 3.4 / 3;                  // glossy rain: 3× smaller
   var vapSz = Math.max(0.18 * wS, Math.min(0.4 * wS, spSz * 5));
   var cloudSz = Math.max(0.30 * wS, Math.min(0.62 * wS, spSz * 6.5));
+  // Cloud-sprite mode keeps the EXACT point size of the procedural puff: the
+  // option changes only WHICH texture a cloud samples — never its geometry —
+  // so any GPU that renders the puff circles renders the sprites too.
+  var cloudSpr = !!(this.cloudSpriteMode && this._cloudSpriteReady);
   var snowSz = spSz * 3.4;                       // snow: same disc size as water
   var beadA = Math.min(1, Math.max(0, this.waterOpa));
   var sprayA = Math.min(1, 0.95 * this.pOpa);
@@ -1818,7 +1892,10 @@ WaterScene.prototype.updateParticles = function (solver, show) {
       i3 = (e - offC) * 3;
       ax = cPos[i3]; ay = cPos[i3 + 1]; az = cPos[i3 + 2];
       rC = cCol[i3]; gC = cCol[i3 + 1]; bC = cCol[i3 + 2];
-      al = cloudA; sz = cloudSz; sp = 3;
+      al = cloudA; sz = cloudSz;
+      // sprite mode (and the image on board) → dedicated cloud_sprite texture
+      // (tile 5); otherwise the procedural near-opaque puff circle (tile 3)
+      sp = cloudSpr ? CLOUD_SPRITE_TILE : 3;
     } else {
       i3 = (e - offS) * 3;
       ax = sPos[i3]; ay = sPos[i3 + 1]; az = sPos[i3 + 2];
@@ -1878,6 +1955,42 @@ WaterScene.prototype.setMetaballs = function (on) {
     }
   }
   if (this.waterMesh) this.waterMesh.visible = !this.beadsMode && !this.metaballMode;
+};
+
+// Cloud-sprite mode: cloud puffs sample the dedicated img/cloud_sprite.png
+// texture (draw-list tile 5) instead of the procedural grey circle (tile 3).
+// Purely a display switch: physics is untouched, and the point size stays the
+// puff's own, so drawability never differs between the two looks. Until the
+// sprite image has loaded (headless DOMs never fetch it) updateParticles
+// keeps emitting tile 3 — the circles — and this flag alone changes nothing.
+WaterScene.prototype.setCloudSprite = function (on) {
+  this.cloudSpriteMode = !!on;
+};
+
+// One-shot img/cloud_sprite.png fetch: when it arrives the image is uploaded
+// ONCE as its own texture (never repainting the shared atlas) and the
+// uCloudMap uniform swaps to it; only then may updateParticles emit tile 5.
+// A failed fetch logs and leaves the procedural circles in charge forever.
+WaterScene.prototype._loadCloudSpriteImage = function () {
+  if (typeof Image === 'undefined') return;           // headless: keep the puff
+  var self = this;
+  try {
+    var img = new Image();
+    img.onload = function () {
+      var tex = makeCloudSpriteTexture(img);
+      if (!tex) return;                               // headless canvas stub
+      self.cloudSpriteTex = tex;
+      if (self.allMat) {
+        self.allMat.uniforms.uCloudMap.value = tex;
+        self.allMat.uniforms.uCloudAspect.value = img.naturalHeight / img.naturalWidth;
+      }
+      self._cloudSpriteReady = true;
+    };
+    img.onerror = function () {
+      console.warn('WaterSim: img/cloud_sprite.png could not be loaded — clouds keep the procedural circles');
+    };
+    img.src = CLOUD_SPRITE_URL;
+  } catch (e) { /* no image support → the procedural puff stays */ }
 };
 
 // Water hue from the UI color picker tints the surface and detached spray.
